@@ -7,7 +7,8 @@ from skimage.filters import gaussian
 import vedo
 from scipy import ndimage
 import matplotlib.pyplot as plt
-from collections import defaultdict
+from scipy.spatial import cKDTree
+import time
 
 def load_artery(filepath, artery_name):
     """Ulepszone ładowanie z lepszą kontrolą błędów i preprocessing"""
@@ -92,30 +93,29 @@ def adaptive_diameter_calculation(p, dist_map, skeleton, points, spacing, base_w
         return 2 * dist_map[z, y, x]
     return np.median(diameters)
 
-def build_graph(points, skeleton, dist_map, spacing, artery_name):
+def build_graph(points, skeleton, dist_map, spacing, artery_name,radius_voxels=1.5):
     if len(points) == 0:
         print(f"No points to build graph for {artery_name} artery")
         return nx.Graph(), {}
     point_to_id = {tuple(p): i for i, p in enumerate(points)}
     G = nx.Graph()
+
     for i, point in enumerate(points):
         diameter = adaptive_diameter_calculation(point, dist_map, skeleton, points, spacing)
         G.add_node(i, pos=point, diameter=diameter)
-    for i, point in enumerate(points):
-        point = tuple(point)
-        for dz in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                for dx in [-1, 0, 1]:
-                    if dz == 0 and dy == 0 and dx == 0:
-                        continue
-                    neighbor = (point[0] + dz, point[1] + dy, point[2] + dx)
-                    if neighbor in point_to_id:
-                        dist_3d = np.sqrt(
-                            (dz * spacing[0]) ** 2 +
-                            (dy * spacing[1]) ** 2 +
-                            (dx * spacing[2]) ** 2
-                        )
-                        G.add_edge(point_to_id[point], point_to_id[neighbor], weight=dist_3d)
+
+    # Budujemy KDTree dla przyspieszenia wyszukiwania sąsiadów
+    scaled_points = points * spacing  # Przeskaluj do jednostek fizycznych (mm)
+    tree = cKDTree(scaled_points)
+
+    # Szukamy sąsiadów w promieniu `radius_voxels` (w mm)
+    neighbor_indices_list = tree.query_ball_tree(tree, r=radius_voxels * np.min(spacing) * 1.75)
+
+    for i, neighbors in enumerate(neighbor_indices_list):
+        for j in neighbors:
+            if i != j and not G.has_edge(i, j):
+                dist = np.linalg.norm(scaled_points[i] - scaled_points[j])
+                G.add_edge(i, j, weight=dist)
     print(f"{artery_name} artery: graph has {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
     return G, point_to_id
 
@@ -184,15 +184,14 @@ def enhanced_visualization(path_points, diameters, stenosis_regions, artery_name
 
 # --- Wczytanie danych ---
 left_mask, left_skeleton, left_points, left_dist_map, left_spacing = load_artery(
-    r"C:\Users\student.VIRMED\Desktop\Slicer_JM\CADRADS 1\Segmentation_right.nrrd", "Left")
+    r"C:\Users\student.VIRMED\Desktop\Slicer_JM\CADRADS 1\Segmentation_left.nrrd", "Left")
 right_mask, right_skeleton, right_points, right_dist_map, right_spacing = load_artery(
-    r"C:\Users\student.VIRMED\Desktop\Slicer_JM\CADRADS 1\Segmentation_left.nrrd", "Right")
+    r"C:\Users\student.VIRMED\Desktop\Slicer_JM\CADRADS 1\Segmentation_right.nrrd", "Right")
 
 # --- Tworzenie grafów ---
 G_left, left_point_to_id = build_graph(left_points, left_skeleton, left_dist_map, left_spacing, "Left")
 G_right, right_point_to_id = build_graph(right_points, right_skeleton, right_dist_map, right_spacing, "Right")
 
-global left_mesh, left_skel, right_mesh, right_skel
 
 left_mesh = vedo.Volume(left_mask).isosurface().c('lightgreen').alpha(0.2)
 left_skel = vedo.Points(left_points, r=3, c='darkgreen')
@@ -204,75 +203,6 @@ right_skel = vedo.Points(right_points, r=3, c='darkblue') if len(right_points) >
 
 plt = vedo.Plotter(title="Kliknij 3 punkty: start, koniec1, koniec2\n[L]-lewa [P]-prawa [R]-reset",
                    axes=1, bg='white', size=(1000, 800))
-
-# --- Tooltip i podświetlenie skeletonu po najechaniu myszką ---
-
-hovered_label = None   # globalny obiekt z tekstem
-hovered_sphere = None  # globalny obiekt z kulą
-
-def handle_mousemove(event):
-    global hovered_label, hovered_sphere
-    pos = event.picked3d
-    if pos is None:
-        if hovered_label:
-            plt.remove(hovered_label)
-            hovered_label = None
-        if hovered_sphere:
-            plt.remove(hovered_sphere)
-            hovered_sphere = None
-        plt.render()
-        return
-
-    # Wybierz najbliższy skeleton
-    distances_left = np.linalg.norm(left_points - pos, axis=1) if len(left_points) else [np.inf]
-    distances_right = np.linalg.norm(right_points - pos, axis=1) if len(right_points) else [np.inf]
-    closest_left = np.min(distances_left)
-    closest_right = np.min(distances_right)
-    if closest_left < closest_right:
-        points = left_points
-        dist_map = left_dist_map
-        skeleton = left_skeleton
-        spacing = left_spacing
-        artery = 'left'
-        min_dist = closest_left
-    else:
-        points = right_points
-        dist_map = right_dist_map
-        skeleton = right_skeleton
-        spacing = right_spacing
-        artery = 'right'
-        min_dist = closest_right
-
-    # Jeśli najbliższy punkt jest daleko (>3mm), nie pokazuj nic
-    if min_dist > 1.0:
-        if hovered_label:
-            plt.remove(hovered_label)
-            hovered_label = None
-        if hovered_sphere:
-            plt.remove(hovered_sphere)
-            hovered_sphere = None
-        plt.render()
-        return
-
-    idx = np.argmin(np.linalg.norm(points - pos, axis=1))
-    p = points[idx]
-    diameter = adaptive_diameter_calculation(p, dist_map, skeleton, points, spacing)
-    text = f"{artery.capitalize()} diameter: {diameter:.2f} mm"
-
-    # Usuń poprzednie tooltipy
-    if hovered_label:
-        plt.remove(hovered_label)
-    if hovered_sphere:
-        plt.remove(hovered_sphere)
-
-    hovered_label = vedo.Text3D(text, s=12, pos=p + [5, 5, 5], c='black')
-    hovered_sphere = vedo.Sphere(pos=p, r=2, c='yellow', alpha=0.7)
-    plt.add(hovered_label)
-    plt.add(hovered_sphere)
-    plt.render()
-
-plt.add_callback('MouseMove', handle_mousemove)
-
 objects = [left_mesh, left_skel]
 if right_mesh: objects.append(right_mesh)
 if right_skel: objects.append(right_skel)
@@ -282,23 +212,40 @@ selected_points_left = []
 selected_points_right = []
 visual_objects_left = []
 visual_objects_right = []
+# ... (previous imports remain the same)
+
+selected_points_left = []
+selected_points_right = []
+visual_objects_left = []
+visual_objects_right = []
+stenosis_objects_left = []  # Lista do śledzenia znaczników zwężeń
+stenosis_objects_right = []  # Lista do śledzenia znaczników zwężeń
+removed_stenosis = []  # Przechowuje usunięte zwężenia
+cadrads_results = []   # Przechowuje wyniki analizy
+
 
 def reset_selection(artery='all'):
     global selected_points_left, selected_points_right
     global visual_objects_left, visual_objects_right
+    global stenosis_objects_left, stenosis_objects_right
     global left_mesh, left_skel, right_mesh, right_skel
+
     if artery in ['left', 'all']:
-        for obj in visual_objects_left:
+        for obj in visual_objects_left + stenosis_objects_left:
             plt.remove(obj)
         selected_points_left.clear()
         visual_objects_left.clear()
-        print("[LEFT] Selections and paths reset.")
+        stenosis_objects_left.clear()
+        print("[LEFT] Resetowano wybór i ścieżki.")
+
     if artery in ['right', 'all']:
-        for obj in visual_objects_right:
+        for obj in visual_objects_right + stenosis_objects_right:
             plt.remove(obj)
         selected_points_right.clear()
         visual_objects_right.clear()
-        print("[RIGHT] Selections and paths reset.")
+        stenosis_objects_right.clear()
+        print("[RIGHT] Resetowano wybór i ścieżki.")
+
     plt.clear()
     left_mesh = vedo.Volume(left_mask).isosurface().c('lightgreen').alpha(0.2)
     left_skel = vedo.Points(left_points, r=3, c='darkgreen')
@@ -307,24 +254,71 @@ def reset_selection(artery='all'):
     else:
         right_mesh = None
     right_skel = vedo.Points(right_points, r=3, c='darkblue') if len(right_points) > 0 else None
+
     objects = [left_mesh, left_skel]
     if right_mesh: objects.append(right_mesh)
     if right_skel: objects.append(right_skel)
     plt.add(objects)
     plt.render()
-    print("Scene fully reset. You can select points again.")
+    print("Zresetowano scenę. Możesz ponownie wybierać punkty.")
+
 
 def handle_click(event):
+    global removed_stenosis
     if not event.actor or event.keypress:
         return
+
     clicked_pos = event.picked3d
     if clicked_pos is None:
         return
+
+    # 1. PRIORYTET: Znajdź najbliższy znacznik zwężenia (nawet głęboko położony)
+    all_stenosis = stenosis_objects_left + stenosis_objects_right
+    if all_stenosis:
+        stenosis_positions = [np.array(s.pos()) for s in all_stenosis]
+        tree = cKDTree(stenosis_positions)
+        indices = tree.query_ball_point(clicked_pos, r=10.0)
+
+        if indices:
+            distances = [np.linalg.norm(np.array(all_stenosis[i].pos()) - clicked_pos) for i in indices]
+            closest_idx = indices[np.argmin(distances)]
+            closest_stenosis = all_stenosis[closest_idx]
+
+            # ZAPISZ USUNIĘTY ZNACZNIK (POPRAWIONA WERSJA)
+            removed_stenosis.append({
+                'position': closest_stenosis.pos(),
+                'artery': 'left' if closest_stenosis in stenosis_objects_left else 'right',
+                'time_removed': time.time(),
+                'color': closest_stenosis.color,  # Pobierz kolor
+                'radius': closest_stenosis.radius,  # Pobierz promień
+                'alpha': closest_stenosis.alpha  # Pobierz przezroczystość
+            })
+
+            plt.remove(closest_stenosis)
+            if closest_stenosis in stenosis_objects_left:
+                stenosis_objects_left.remove(closest_stenosis)
+            else:
+                stenosis_objects_right.remove(closest_stenosis)
+            print(f"Usunięto znacznik zwężenia w {closest_stenosis.pos()}")
+            plt.render()
+            return
+
+
+    # 2. Jeśli nie znaleziono znacznika, kontynuuj normalny wybór punktów
     distances_left = np.linalg.norm(left_points - clicked_pos, axis=1) if len(left_points) else [np.inf]
     distances_right = np.linalg.norm(right_points - clicked_pos, axis=1) if len(right_points) else [np.inf]
-    closest_left = np.min(distances_left)
-    closest_right = np.min(distances_right)
-    if closest_left < closest_right:
+    min_left_dist = np.min(distances_left)
+    min_right_dist = np.min(distances_right)
+
+    # Reszta funkcji pozostaje bez zmian...
+
+    # Sprawdź czy kliknięto wystarczająco blisko którejś tętnicy
+    if min_left_dist > 5.0 and min_right_dist > 5.0:
+        print("Kliknięto zbyt daleko od tętnic. Wybierz punkt bliżej szkieletu.")
+        return
+
+    # Wybierz tętnicę na podstawie najbliższego punktu
+    if min_left_dist < min_right_dist:
         artery = 'left'
         points = left_points
         selected_points = selected_points_left
@@ -333,6 +327,7 @@ def handle_click(event):
         dist_map = left_dist_map
         skeleton = left_skeleton
         spacing = left_spacing
+        max_points = 3
     else:
         artery = 'right'
         points = right_points
@@ -342,33 +337,47 @@ def handle_click(event):
         dist_map = right_dist_map
         skeleton = right_skeleton
         spacing = right_spacing
-    if len(points) == 0:
-        print(f"No skeleton points for {artery.upper()}!")
-        return
-    max_points = 3 if artery == 'left' else 2
+        max_points = 2
+
+    # 3. Sprawdź czy można dodać nowy punkt do wybranej tętnicy
     if len(selected_points) >= max_points:
-        print(f"Already selected {max_points} points for {artery} artery.")
+        print(f"Uwaga: Osiągnięto maks. liczbę punktów ({max_points}) dla tętnicy {artery}.")
+        print("Kliknij 'L' aby zresetować lewą tętnicę, 'P' dla prawej, lub 'R' aby zresetować wszystko.")
         return
+
+    # 4. Dodaj nowy punkt
     distances = np.linalg.norm(points - clicked_pos, axis=1)
     closest_idx = np.argmin(distances)
     closest_point = points[closest_idx]
+
+    # Sprawdź czy punkt nie jest już wybrany
+    if closest_idx in selected_points:
+        print(f"Punkt {closest_idx} został już wybrany. Wybierz inny punkt.")
+        return
+
     selected_points.append(closest_idx)
+
     colors = ['green', 'red', 'orange'] if artery == 'left' else ['green', 'red']
     point_color = colors[len(selected_points) - 1]
-    point_sphere = vedo.Sphere(pos=closest_point, r=1, c=point_color)
+    point_sphere = vedo.Sphere(pos=closest_point, r=1.5, c=point_color)
     plt.add(point_sphere)
     visual_objects.append(point_sphere)
-    print(f"[{artery.upper()}] Clicked point index: {closest_idx}, Coordinates: {closest_point}")
+    print(f"[{artery.upper()}] Dodano punkt: Indeks {closest_idx}, Współrzędne {closest_point}")
+
+    # 5. Jeśli osiągnięto wymaganą liczbę punktów, znajdź ścieżki
     if (artery == 'left' and len(selected_points) == 3) or (artery == 'right' and len(selected_points) == 2):
         find_paths(artery, G, points, selected_points, visual_objects, dist_map, skeleton, spacing)
 
+
 def find_paths(artery, G, points, selected_points, visual_objects, dist_map, skeleton, spacing):
     if (artery == 'left' and len(selected_points) < 3) or (artery == 'right' and len(selected_points) < 2):
-        print(f"Too few points for {artery} artery.")
+        print(f"Za mało punktów dla tętnicy {artery}.")
         return
+
     start_idx = selected_points[0]
     end1_idx = selected_points[1]
     end2_idx = selected_points[2] if artery == 'left' else None
+
     def path_diameter_report(path, points, dist_map, skeleton, spacing):
         diameters = []
         for idx in path:
@@ -376,67 +385,79 @@ def find_paths(artery, G, points, selected_points, visual_objects, dist_map, ske
             diam = adaptive_diameter_calculation(p, dist_map, skeleton, points, spacing)
             diameters.append(diam)
         return diameters
+
     try:
         path1 = nx.shortest_path(G, start_idx, end1_idx)
         path1_points = points[path1]
         diams1 = path_diameter_report(path1, points, dist_map, skeleton, spacing)
         line1 = vedo.Line(path1_points)
-        line1.cmap('jet', diams1)
+        line1.cmap('jet_r', diams1)
         line1.lw(8)
         if artery == 'left':
-            line1.add_scalarbar(title="Left diameter [mm]", pos=((0, 0.05), (0.1, 0.35)))
+            line1.add_scalarbar(title="Średnica lewej tętnicy [mm]", pos=((0, 0.05), (0.1, 0.35)))
         elif artery == 'right':
-            line1.add_scalarbar(title="Right diameter [mm]", pos=((0.85, 0.05), (0.95, 0.35)))
+            line1.add_scalarbar(title="Średnica prawej tętnicy [mm]", pos=((0.85, 0.05), (0.95, 0.35)))
         plt.add(line1)
         visual_objects.append(line1)
-        print(f"[{artery.upper()}] Path 1: {len(path1)} points")
-        print("Diameter on path 1 (mm):", np.round(diams1, 2))
+        print(f"[{artery.upper()}] Ścieżka 1: {len(path1)} punktów")
+        print("Średnice na ścieżce 1 (mm):", np.round(diams1, 2))
+
         regions1, stenosis_values1 = detect_local_stenosis(
             diams1,
             spacing=spacing,
-            window_mm=7,
+            window_mm=8,
             min_stenosis=20,
-            min_length_pts=3
+            min_length_pts=4
         )
+
         if regions1:
-            enhanced_visualization(path1_points, diams1, regions1, artery + " - Path 1")
+            enhanced_visualization(path1_points, diams1, regions1, artery + " - Ścieżka 1")
+            for region in regions1:
+                sten_point = points[path1[region['max_stenosis_idx']]]
+                sten_sphere = vedo.Sphere(pos=sten_point, r=3.0, c='red').alpha(0.5)
+                sten_sphere.pickable(True)  # Umożliwia kliknięcie przez inne obiekty
+                plt.add(sten_sphere)
+                if artery == 'left':
+                    stenosis_objects_left.append(sten_sphere)
+                else:
+                    stenosis_objects_right.append(sten_sphere)
         else:
-            print(f"[{artery.upper()}] Nie znaleziono istotnych regionów zwężenia dla ścieżki 1")
-        for region in regions1:
-            sten_point = points[path1[region['max_stenosis_idx']]]
-            sten_sphere = vedo.Sphere(pos=sten_point, r=1.5, c='red')
-            plt.add(sten_sphere)
-            visual_objects.append(sten_sphere)
+            print(f"[{artery.upper()}] Nie znaleziono istotnych zwężeń dla ścieżki 1")
+
     except nx.NetworkXNoPath:
-        print(f"[{artery.upper()}] No path 1 found")
+        print(f"[{artery.upper()}] Nie znaleziono ścieżki 1")
+
     if artery == 'left':
         try:
             path2 = nx.shortest_path(G, start_idx, end2_idx)
             path2_points = points[path2]
             diams2 = path_diameter_report(path2, points, dist_map, skeleton, spacing)
             line2 = vedo.Line(path2_points)
-            line2.cmap('jet', diams2)
+            line2.cmap('jet_r', diams2)
             line2.lw(8)
             plt.add(line2)
             visual_objects.append(line2)
-            print(f"[{artery.upper()}] Path 2: {len(path2)} points")
-            print("Diameter on path 2 (mm):", np.round(diams2, 2))
+            print(f"[{artery.upper()}] Ścieżka 2: {len(path2)} punktów")
+            print("Średnice na ścieżce 2 (mm):", np.round(diams2, 2))
+
             regions2, stenosis_values2 = detect_local_stenosis(
                 diams2,
                 spacing=spacing,
-                window_mm=7,
+                window_mm=8,
                 min_stenosis=20,
-                min_length_pts=3
+                min_length_pts=4
             )
+
             if regions2:
-                enhanced_visualization(path2_points, diams2, regions2, artery + " - Path 2")
+                enhanced_visualization(path2_points, diams2, regions2, artery + " - Ścieżka 2")
+                for region in regions2:
+                    sten_point = points[path2[region['max_stenosis_idx']]]
+                    sten_sphere = vedo.Sphere(pos=sten_point, r=1.5, c='red')
+                    plt.add(sten_sphere)
+                    stenosis_objects_left.append(sten_sphere)
             else:
-                print(f"[{artery.upper()}] Nie znaleziono istotnych regionów zwężenia dla ścieżki 2")
-            for region in regions2:
-                sten_point = points[path2[region['max_stenosis_idx']]]
-                sten_sphere = vedo.Sphere(pos=sten_point, r=1.5, c='red')
-                plt.add(sten_sphere)
-                visual_objects.append(sten_sphere)
+                print(f"[{artery.upper()}] Nie znaleziono istotnych zwężeń dla ścieżki 2")
+
             if 'path1' in locals() and 'path2' in locals():
                 common_length = min(len(path1), len(path2))
                 branch_point_idx = 0
@@ -448,21 +469,108 @@ def find_paths(artery, G, points, selected_points, visual_objects, dist_map, ske
                 branch_sphere = vedo.Sphere(pos=branch_point, r=1, c='purple')
                 plt.add(branch_sphere)
                 visual_objects.append(branch_sphere)
-                print(f"[{artery.upper()}] Branch point: {branch_point}")
+                print(f"[{artery.upper()}] Punkt rozgałęzienia: {branch_point}")
         except nx.NetworkXNoPath:
-            print(f"[{artery.upper()}] No path 2 found")
-    print(f"[{artery.upper()}] Checking paths between indices: {selected_points}")
+            print(f"[{artery.upper()}] Nie znaleziono ścieżki 2")
+
     plt.render()
 
+
+def on_mouse_move(event):
+    # Przywróć poprzednie kolory wszystkim obiektom
+    for obj in stenosis_objects_left + stenosis_objects_right:
+        obj.color('red').alpha(0.7)  # Czerwony z przezroczystością
+
+    # Podświetl aktualny obiekt
+    if event.actor and (event.actor in stenosis_objects_left or event.actor in stenosis_objects_right):
+        event.actor.color('yellow').alpha(0.9)  # Żółty z mniejszą przezroczystością
+        plt.render()
+
+
+def reload_removed_stenosis():
+    global stenosis_objects_left, stenosis_objects_right
+
+    for stenosis in removed_stenosis:
+        sten_sphere = vedo.Sphere(
+            pos=stenosis['position'],
+            r=stenosis['radius']
+        ).color(stenosis['color']).alpha(stenosis['alpha'])
+
+        if stenosis['artery'] == 'left':
+            stenosis_objects_left.append(sten_sphere)
+        else:
+            stenosis_objects_right.append(sten_sphere)
+
+        plt.add(sten_sphere)
+
+    removed_stenosis.clear()
+    plt.render()
+
+def calculate_cadrads():
+    global cadrads_results
+
+    # Analizuj obecne zwężenia
+    current_stenosis = []
+    for obj in stenosis_objects_left:
+        current_stenosis.append({'artery': 'left', 'position': obj.pos()})
+    for obj in stenosis_objects_right:
+        current_stenosis.append({'artery': 'right', 'position': obj.pos()})
+
+    # Tutaj dodaj rzeczywistą logikę klasyfikacji CAD-RADS
+    # Przykład uproszczony:
+    cadrads_score = "CAD-RADS 0"
+    if len(current_stenosis) > 0:
+        if len(current_stenosis) >= 3:
+            cadrads_score = "CAD-RADS 4B"
+        elif len(current_stenosis) >= 1:
+            cadrads_score = "CAD-RADS 3"
+
+    # Generuj raport
+    report = {
+        'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
+        'total_stenosis': len(current_stenosis),
+        'left_artery': len(stenosis_objects_left),
+        'right_artery': len(stenosis_objects_right),
+        'cadrads_score': cadrads_score,
+        'details': current_stenosis
+    }
+
+    cadrads_results.append(report)
+    return report
+
+def show_cadrads_report():
+    if not cadrads_results:
+        print("Brak danych do wygenerowania raportu CAD-RADS")
+        return
+
+    latest_report = cadrads_results[-1]
+
+    # Wizualizacja raportu
+    report_text = f"""
+    ===== RAPORT CAD-RADS =====
+    Data: {latest_report['timestamp']}
+    Łączna liczba zwężeń: {latest_report['total_stenosis']}
+    - Lewa tętnica: {latest_report['left_artery']}
+    - Prawa tętnica: {latest_report['right_artery']}
+    Ocena CAD-RADS: {latest_report['cadrads_score']}
+    """
+
+    print(report_text)
+
+    # Możesz też wyświetlić to w oknie Vedo
+    txt = vedo.Text2D(report_text, pos='top-left', c='k', bg='y', alpha=0.8)
+    plt.add(txt).render()
+
 def handle_keypress(event):
-    key = event.keypress.lower()
-    if key == 'r':
+    if event.keypress == 'r':  # Reset
         reset_selection('all')
-    elif key == 'l':
-        reset_selection('left')
-    elif key == 'p':
-        reset_selection('right')
+    elif event.keypress == 'l':  # Załaduj usunięte zwężenia
+        reload_removed_stenosis()
+    elif event.keypress == 'c':  # Oblicz CAD-RADS
+        calculate_cadrads()
+        show_cadrads_report()
 
 plt.add_callback('LeftButtonPress', handle_click)
+plt.add_callback('MouseMove', on_mouse_move)
 plt.add_callback("KeyPress", handle_keypress)
 plt.interactive().close()
