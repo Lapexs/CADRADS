@@ -268,10 +268,10 @@ def enhanced_visualization(path_points, diameters, stenosis_regions, artery_name
 
 # --- Wczytanie danych ---
 left_mask, left_skeleton, left_points, left_dist_map, left_spacing = load_artery(
-    r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 4v2\Segmentation_left.nrrd", "Left")
+    r"C:\Users\PC\Desktop\INZYNIERKA\Test\Jedna\Jedna_1-Jedna-label.nrrd", "Left")
 
 right_mask, right_skeleton, right_points, right_dist_map, right_spacing = load_artery(
-    r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 4v2\Segmentation_right.nrrd", "Right")
+    r"C:\Users\PC\Desktop\INZYNIERKA\Test\Dwie\Dwie_4-Dwie-label.nrrd", "Right")
 
 
 # --- Tworzenie grafów ---
