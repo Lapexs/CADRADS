@@ -1,32 +1,40 @@
 import numpy as np
-import networkx as nx
+import itertools
+import time
 import os
-import matplotlib
-matplotlib.use('Agg') # Generowanie w tle
+import sys
+import networkx as nx
+import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.ndimage import gaussian_filter1d
-
 # =============================================================================
-# 1. IMPORTY
+# IMPORTY Z PLIKU GŁÓWNEGO
 # =============================================================================
-
 from gradient2 import Artery, compute_upsampled_path, adaptive_diameter_calculation, detect_local_stenosis_with_grad
 
 
 # =============================================================================
-# 2. TWÓJ "ZŁOTY STANDARD" (PUNKT PRACY)
-# To są parametry, które wybrałeś jako najlepsze.
-# Wszystkie wykresy będą pokazywać odchylenia od TEGO punktu.
+# 1. ZAKRESY POSZUKIWAŃ (BARDZO GĘSTE - TAK JAK CHCIAŁEŚ)
+# Uwaga: Liczba kombinacji to iloczyn długości tych tablic!
 # =============================================================================
-BEST_WINDOW = 11.0
-BEST_LEN_MM = 3.0
-BEST_PCT    = 24.0
-BEST_GRAD   = -0.19
+SEARCH_SPACE = {
+    # Window: od 10 do 20 co 1.0 (10, 11, ... 20) -> 11 wartości
+    'WINDOW':  np.arange(7, 20, 1.0), 
+    
+    # Length: od 2.0 do 4.0 co 0.2 (2.0, 2.2, ... 4.0) -> 11 wartości
+    'LEN_MM':  np.arange(2.0, 4.0, 0.1), 
+    
+    # Percent: od 20 do 30 co 2.5 (20, 22.5, 25, 27.5, 30) -> 5 wartości
+    'PCT':     np.arange(15, 30, 1),   
+    
+    # Gradient: od -0.10 do -0.20 co 0.02 -> 6 wartości
+    'GRAD':    np.arange(-0.10, -0.20, -0.01) 
+}
 
-TOLERANCE_MM = 10.0
+# Razem: 11 * 11 * 5 * 6 = ~3,630 kombinacji.
+# To jest wykonalne (powinno zająć ok. 30-60 minut na dobrym PC).
 
 # =============================================================================
-# 3. DANE PACJENTÓW (WKLEJ SWOJĄ LISTĘ)
+# 2. DANE PACJENTÓW (WKLEJ SWOJE DANE TUTAJ)
 # =============================================================================
 PATIENTS = {
     "P1": [
@@ -312,20 +320,54 @@ PATIENTS = {
 }
 
 # =============================================================================
-# 4. FUNKCJA OBLICZENIOWA (POPRAWIONA LOGIKA F1/ZDROWI)
+# 3. PRZYGOTOWANIE DANYCH (CACHE)
 # =============================================================================
-def calculate_f1_scores_list(data_by_patient, win, pct, length, grad):
-    """Zwraca listę wyników F1 dla każdego pacjenta osobno."""
-    scores = []
+def prepare_data_per_patient():
+    print("-> [CACHE] Ładowanie danych do pamięci...")
+    data_by_patient = {}
+    
+    for patient_id, arteries in PATIENTS.items():
+        print(f"   Wczytuję: {patient_id}")
+        patient_data = []
+        for conf in arteries:
+            if not os.path.exists(conf['file_path']): continue
+            try:
+                a = Artery("X", conf['file_path'])
+                a.load()
+                if conf['start_node'] in a.graph and conf['end_node'] in a.graph:
+                    path_idxs = nx.shortest_path(a.graph, conf['start_node'], conf['end_node'])
+                    path_pts = a.points[path_idxs]
+                    # Pre-obliczanie średnic, żeby nie robić tego w pętli
+                    diams = [adaptive_diameter_calculation(p, a.dist_map, a.skeleton, a.points, a.spacing) for p in path_pts]
+                    _, cum_orig, _, _, _ = compute_upsampled_path(path_pts, a.spacing)
+                    
+                    patient_data.append({
+                        "diameters": diams,
+                        "spacing": a.spacing,
+                        "cum_orig": cum_orig,
+                        "true_stenoses": conf['true_stenoses_mm']
+                    })
+            except Exception as e:
+                print(f"Błąd u {patient_id}: {e}")
+        data_by_patient[patient_id] = patient_data
+    return data_by_patient
+
+# =============================================================================
+# 4. FUNKCJA OCENY (LOGIKA HYBRYDOWA)
+# =============================================================================
+TOLERANCE_MM = 10.0
+
+def evaluate_combination(data_by_patient, win, length, pct, grad):
+    f1_scores = []
     
     for pid, arteries_data in data_by_patient.items():
-        tp_total, fp_total, fn_total = 0, 0, 0
-        total_true_stenoses_count = 0
+        tp, fp, fn = 0, 0, 0
+        total_true = 0
         
         for artery in arteries_data:
-            total_true_stenoses_count += len(artery['true_stenoses'])
+            total_true += len(artery['true_stenoses'])
             
-            # Detekcja (z rozpakowaniem krotki)
+            # Detekcja (Rozpakowanie krotki!)
             regions, _ = detect_local_stenosis_with_grad(
                 artery['diameters'], artery['spacing'],
                 window_mm=win, min_stenosis=pct, min_length_mm=length,
@@ -344,140 +386,197 @@ def calculate_f1_scores_list(data_by_patient, win, pct, length, grad):
                 if match: local_tp += 1
                 else: local_fp += 1
             
-            tp_total += local_tp
-            fp_total += local_fp
-            fn_total += len(true_rem)
+            tp += local_tp
+            fp += local_fp
+            fn += len(true_rem)
             
-        # Ocena pacjenta
-        if total_true_stenoses_count == 0:
-            # Zdrowy: 1.0 jak nic nie wykryto, 0.0 jak fałszywy alarm
-            score = 1.0 if fp_total == 0 else 0.0
+        # Ocena hybrydowa
+        if total_true == 0: 
+            score = 1.0 if fp == 0 else 0.0
         else:
-            # Chory: klasyczne F1
-            prec = tp_total/(tp_total+fp_total) if (tp_total+fp_total) > 0 else 0
-            rec = tp_total/(tp_total+fn_total) if (tp_total+fn_total) > 0 else 0
+            prec = tp/(tp+fp) if (tp+fp) > 0 else 0
+            rec = tp/(tp+fn) if (tp+fn) > 0 else 0
             score = 2*(prec*rec)/(prec+rec) if (prec+rec) > 0 else 0
             
-        scores.append(score)
+        f1_scores.append(score)
         
-    return scores
+    return np.mean(f1_scores)
 
-# =============================================================================
-# 5. FUNKCJA RYSOWANIA (ERROR BARS + SCATTER)
-# =============================================================================
-def make_plot(param_name, x_values, all_scores, filename, x_label, best_val_x):
-    # Statystyki
-    means = [np.mean(s) for s in all_scores]
-    stds  = [np.std(s) for s in all_scores]
+def plot_heatmap(data_results, param_x, param_y, fixed_params, filename):
+    print(f"   -> Generuję mapę: {param_x} vs {param_y}...")
+    filtered = []
+    for score, params in data_results:
+        match = True
+        for k, v in fixed_params.items():
+            if abs(params[k] - v) > 0.001: match = False; break
+        if match: filtered.append((params[param_x], params[param_y], score))
+
+    if not filtered:
+        print(f"      [OSTRZEŻENIE] Brak danych dla mapy! Sprawdź fixed_params.")
+        return
+
+    vals_x = sorted(list(set([f[0] for f in filtered])))
+    vals_y = sorted(list(set([f[1] for f in filtered])))
+    if param_x == 'GRAD': vals_x.sort(reverse=True)
+    if param_y == 'GRAD': vals_y.sort(reverse=True)
+
+    matrix = np.zeros((len(vals_y), len(vals_x)))
+    for x_val, y_val, score in filtered:
+        try:
+            ix = vals_x.index(x_val); iy = vals_y.index(y_val)
+            matrix[iy, ix] = score
+        except: continue
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    im = ax.imshow(matrix, cmap='inferno', origin='lower', aspect='auto') 
     
-    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.set_xticks(np.arange(len(vals_x)))
+    ax.set_yticks(np.arange(len(vals_y)))
+    ax.set_xticklabels([f"{v:.2f}" for v in vals_x], rotation=45)
+    ax.set_yticklabels([f"{v:.2f}" for v in vals_y])
+    ax.set_xlabel(param_x, fontsize=12); ax.set_ylabel(param_y, fontsize=12)
     
-    # 1. Rysowanie punktów pacjentów (Scatter)
-    for i, x in enumerate(x_values):
-        y_vals = all_scores[i]
-        # Jitter X (rozrzut)
-        jitter = np.random.normal(0, (max(x_values)-min(x_values))*0.015, size=len(y_vals))
-        ax.scatter(x + jitter, y_vals, color='gray', alpha=0.35, s=25, zorder=2)
+    fixed_str = ", ".join([f"{k}={v}" for k,v in fixed_params.items()])
+    ax.set_title(f"Mapa Stabilności: {param_x} vs {param_y}\n(Przy stałych: {fixed_str})", fontsize=14)
+    plt.colorbar(im, ax=ax).ax.set_ylabel("F1-Score", rotation=-90, va="bottom")
 
-    # 2. Rysowanie średniej i odchylenia (Error Bar)
-    ax.errorbar(x_values, means, yerr=stds, fmt='o-', 
-                color='#0056b3', ecolor='#d9534f', elinewidth=2, capsize=4, 
-                markersize=6, zorder=3, label='Średnia ± Std Dev')
+    if len(vals_x) < 20:
+        for i in range(len(vals_y)):
+            for j in range(len(vals_x)):
+                val = matrix[i, j]
+                text_color = "black" if val > 0.7 else "white"
+                ax.text(j, i, f"{val:.2f}", ha="center", va="center", color=text_color, fontsize=9)
 
-    # 3. Zaznaczenie wybranego OPTIMUM (czerwona kropka)
-    # Znajdujemy indeks wartości najbliższej naszemu BEST_VAL
-    try:
-        best_idx = np.argmin(np.abs(np.array(x_values) - best_val_x))
-        ax.scatter([x_values[best_idx]], [means[best_idx]], s=150, facecolors='none', edgecolors='red', linewidth=2, zorder=4, label='Wybrany Punkt Pracy')
-    except:
-        pass
+    plt.tight_layout(); plt.savefig(filename, dpi=300); plt.close()
+    print(f"   [OK] Zapisano: {filename}")
 
-    # Stylizacja
-    ax.set_title(f'Wpływ parametru: {param_name}', fontsize=14, fontweight='bold', pad=15)
-    ax.set_xlabel(x_label, fontsize=12)
-    ax.set_ylabel('Skuteczność (F1 / Swoistość)', fontsize=12)
-    ax.set_ylim(-0.05, 1.05)
-    ax.grid(True, linestyle='--', alpha=0.6, zorder=0)
-    ax.legend(loc='lower right', frameon=True, framealpha=0.9)
+def plot_parallel_coordinates(results, filename):
+    print(f"   -> Generuję wykres Parallel Coordinates: {filename}...")
+    data = []
+    for score, params in results:
+        row = params.copy(); row['F1'] = score; data.append(row)
     
-    plt.tight_layout()
-    plt.savefig(filename, dpi=300)
-    print(f"[OK] Wykres zapisany: {filename}")
-    plt.close()
+    df = pd.DataFrame(data)
+    threshold_f1 = df['F1'].quantile(0.80) 
+    df_filtered = df[df['F1'] >= threshold_f1].copy().sort_values(by='F1')
+
+    cols = ['WINDOW', 'LEN_MM', 'PCT', 'GRAD', 'F1']
+    min_max = {c: (df[c].min(), df[c].max()) for c in cols}
+    df_norm = df_filtered.copy()
+    for c in cols:
+        if min_max[c][1] != min_max[c][0]:
+            df_norm[c] = (df_filtered[c] - min_max[c][0]) / (min_max[c][1] - min_max[c][0])
+        else: df_norm[c] = 0
+
+    fig, ax = plt.subplots(figsize=(15, 8))
+    for i in range(len(df_norm)):
+        row = df_norm.iloc[i]
+        ax.plot(range(len(cols)), row, color=plt.cm.plasma(row['F1']), alpha=0.5)
+
+    ax.set_xticks(range(len(cols))); ax.set_xticklabels(cols, fontsize=12, fontweight='bold')
+    for i, col in enumerate(cols):
+        ax.axvline(i, color='black', linewidth=1)
+        ax.text(i, -0.05, f"{min_max[col][0]:.2f}", ha='center', va='top')
+        ax.text(i, 1.05, f"{min_max[col][1]:.2f}", ha='center', va='bottom')
+
+    sm = plt.cm.ScalarMappable(cmap=plt.cm.plasma, norm=plt.Normalize(vmin=df_filtered['F1'].min(), vmax=df_filtered['F1'].max()))
+    plt.colorbar(sm, ax=ax).set_label('F1-Score', rotation=270, labelpad=15)
+    plt.title(f"Wykres Współrzędnych Równoległych (TOP 20% Wyników)", fontsize=16)
+    
+    ax.set_yticks([]); ax.spines['top'].set_visible(False); ax.spines['bottom'].set_visible(False)
+    ax.spines['left'].set_visible(False); ax.spines['right'].set_visible(False)
+    plt.tight_layout(); plt.savefig(filename, dpi=300); plt.close()
+    print(f"   [OK] Zapisano: {filename}")
+
 
 # =============================================================================
-# 6. GŁÓWNA PĘTLA
+# 5. GŁÓWNA PĘTLA GRID SEARCH
 # =============================================================================
-def prepare_data_per_patient():
-    # ... (Tu wklejam tę samą funkcję wczytywania co w poprzednim kodzie, dla porządku skrócę wklejanie, ale musi tu być) ...
-    # UŻYJ TEJ SAMEJ FUNKCJI WCZYTYWANIA CO WCZEŚNIEJ
-    # DLA PEWNOŚCI WKLEJAM JĄ JESZCZE RAZ NA DOLE
-    print("-> Ładowanie danych pacjentów...")
-    data_by_patient = {}
-    for patient_id, arteries in PATIENTS.items():
-        print(f"   Wczytuję {patient_id}...")
-        p_data = []
-        for conf in arteries:
-            if not os.path.exists(conf['file_path']): continue
-            try:
-                a = Artery("X", conf['file_path'])
-                a.load()
-                if conf['start_node'] in a.graph and conf['end_node'] in a.graph:
-                    path_idxs = nx.shortest_path(a.graph, conf['start_node'], conf['end_node'])
-                    path_pts = a.points[path_idxs]
-                    diams = [adaptive_diameter_calculation(p, a.dist_map, a.skeleton, a.points, a.spacing) for p in path_pts]
-                    _, cum_orig, _, _, _ = compute_upsampled_path(path_pts, a.spacing)
-                    p_data.append({
-                        "diameters": diams, "spacing": a.spacing, "cum_orig": cum_orig,
-                        "true_stenoses": conf['true_stenoses_mm']
-                    })
-            except: pass
-        data_by_patient[patient_id] = p_data
-    return data_by_patient
-
 if __name__ == "__main__":
-    data_db = prepare_data_per_patient()
-    if not data_db: exit()
+    # 1. Ładowanie danych
+    data_by_patient = prepare_data_per_patient()
     
-    print("\nGenerowanie wykresów do pracy inżynierskiej...")
+    if not data_by_patient:
+        print("Brak danych!")
+        sys.exit()
 
-    # --- 1. WINDOW (Szerokość okna) ---
-    print("-> Analiza Window...")
-    # Zakres testowy: od 5 do 30 co 2.5
-    rng_win = np.arange(7, 15, 1)
-    res_win = []
-    for val in rng_win:
-        # Zmieniamy TYLKO Window, reszta BEST
-        res_win.append(calculate_f1_scores_list(data_db, val, BEST_PCT, BEST_LEN_MM, BEST_GRAD))
-    make_plot("Szerokość Okna", rng_win, res_win, "wykres_window.png", "Window [mm]", BEST_WINDOW)
+    # 2. Generowanie siatki
+    keys = sorted(SEARCH_SPACE.keys())
+    # itertools.product tworzy wszystkie możliwe kombinacje list
+    combinations = list(itertools.product(*(SEARCH_SPACE[k] for k in keys)))
+    total = len(combinations)
+    
+    print("\n" + "="*60)
+    print(f"START GRID SEARCH")
+    print(f"Liczba kombinacji: {total}")
+    print(f"Parametry: {keys}")
+    print("="*60)
+    
+    results = []
+    start_time = time.time()
+    
+    # 3. Pętla (Mielenie)
+    for i, combo in enumerate(combinations):
+        params = dict(zip(keys, combo))
+        
+        score = evaluate_combination(
+            data_by_patient, 
+            win=params['WINDOW'], 
+            length=params['LEN_MM'], 
+            pct=params['PCT'], 
+            grad=params['GRAD']
+        )
+        
+        results.append((score, params))
+        
+        # Pasek postępu co 5%
+        if i % max(1, int(total/20)) == 0:
+            elapsed = time.time() - start_time
+            avg_time = elapsed / (i + 1)
+            eta = (total - i) * avg_time
+            print(f"Postęp: {i}/{total} ({i/total*100:.1f}%) | ETA: {eta/60:.1f} min | Ost. F1: {score:.3f}")
 
-    # --- 2. MIN LENGTH (Długość zwężenia) ---
-    print("-> Analiza Length...")
-    # Zakres: od 1.0 do 6.0 co 0.5
-    rng_len = np.arange(2.0, 5.0, 0.1)
-    res_len = []
-    for val in rng_len:
-        # Zmieniamy TYLKO Length
-        res_len.append(calculate_f1_scores_list(data_db, BEST_WINDOW, BEST_PCT, val, BEST_GRAD))
-    make_plot("Minimalna Długość", rng_len, res_len, "wykres_length.png", "Length [mm]", BEST_LEN_MM)
+    total_time = time.time() - start_time
+    print(f"\n-> Zakończono w {total_time:.1f} sekund.")
+    
+    # 4. Wyniki
+    # Sortujemy malejąco po wyniku F1
+    results.sort(key=lambda x: x[0], reverse=True)
+    
+    print("\n" + "="*60)
+    print("   TOP 10 NAJLEPSZYCH KOMBINACJI")
+    print("="*60)
+    for i in range(min(10, len(results))):
+        score, p = results[i]
+        print(f"{i+1}. F1={score:.4f} | Win={p['WINDOW']:.1f}, Len={p['LEN_MM']:.1f}, Pct={p['PCT']:.1f}, Grad={p['GRAD']:.2f}")
+    
+    # Zapis do pliku txt
+    with open("wyniki_grid_search.txt", "w") as f:
+        for i, (score, p) in enumerate(results):
+            f.write(f"{i+1}. F1={score:.4f} | {p}\n")
+    print("\nPełne wyniki zapisano w 'wyniki_grid_search.txt'")
 
-    # --- 3. PERCENTAGE (Próg zwężenia) ---
-    print("-> Analiza Percentage...")
-    # Zakres: od 15 do 45 co 2.5
-    rng_pct = np.arange(15, 30, 1)
-    res_pct = []
-    for val in rng_pct:
-        res_pct.append(calculate_f1_scores_list(data_db, BEST_WINDOW, val, BEST_LEN_MM, BEST_GRAD))
-    make_plot("Próg Zwężenia", rng_pct, res_pct, "wykres_pct.png", "Stenosis [%]", BEST_PCT)
-
-    # --- 4. GRADIENT ---
-    print("-> Analiza Gradient...")
-    # Zakres: od -0.05 do -0.30 co -0.02
-    rng_grad = np.arange(-0.10, -0.25, -0.01)
-    # Sortujemy malejąco (dla ładnego wykresu, chociaż osie i tak się ustawią)
-    res_grad = []
-    for val in rng_grad:
-        res_grad.append(calculate_f1_scores_list(data_db, BEST_WINDOW, BEST_PCT, BEST_LEN_MM, val))
-    make_plot("Próg Gradientu", rng_grad, res_grad, "wykres_gradient.png", "Gradient [mm/mm]", BEST_GRAD)
-
-    print("\nGotowe! Wykresy w folderze.")
+    print("\nGENEROWANIE WYKRESÓW...")
+    
+    # Przykładowe punkty "stałe" do map ciepła - musisz wybrać jedną wartość z zakresu, żeby przekrój zadziałał
+    # Wybieramy wartości "środkowe" lub Twoje ulubione, o ile istnieją w siatce
+    # Najbezpieczniej wziąć te z najlepszego wyniku
+    best_params = results[0][1]
+    
+    # 1. HEATMAPA: WINDOW vs GRAD (przy najlepszym Len i Pct)
+    plot_heatmap(results, 'WINDOW', 'GRAD', 
+                 {'LEN_MM': best_params['LEN_MM'], 'PCT': best_params['PCT']}, 
+                 'gs_heatmap_win_grad.png')
+    
+    # 2. HEATMAPA: LEN vs PCT (przy najlepszym Win i Grad)
+    plot_heatmap(results, 'LEN_MM', 'PCT', 
+                 {'WINDOW': best_params['WINDOW'], 'GRAD': best_params['GRAD']}, 
+                 'gs_heatmap_len_pct.png')
+    
+    # 3. PARALLEL COORDINATES
+    try:
+        plot_parallel_coordinates(results, 'gs_parallel_coords.png')
+    except NameError:
+        print("Brak pandas - pomijam wykres równoległy.")
+    except Exception as e:
+        print(f"Błąd rysowania Parallel Coords: {e}")

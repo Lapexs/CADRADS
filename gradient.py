@@ -11,37 +11,31 @@ from scipy.spatial import cKDTree
 import time
 import threading 
 from scipy.ndimage import gaussian_filter1d
-from scipy.signal import savgol_filter
-
-
+import os
 import matplotlib
-matplotlib.use('Agg')  # wymusza osobne okno Matplotlib, niezależne od Vedo
+matplotlib.use('Agg') # Zapobiega wyskakiwaniu okienek wykresów
 
-paths_data = []
+# =================================================================
+# 1. KONFIGURACJA OSTATECZNA (FINAL STABLE)
+# Parametry dobrane na podstawie pełnej walidacji.
+# =================================================================
 
+UPSAMPLE_FACTOR = 8
+BIFURCATION_MERGE_RADIUS_MM = 2.0
+BIFURCATION_MIN_BRANCH_LENGTH_MM = 5.0
+BIFURCATION_BUFFER_MM = 10 # Bufor bezpieczeństwa przy rozwidleniach
 
-def load_artery(filepath, artery_name):
-    """Ulepszone ładowanie z lepszą kontrolą błędów i preprocessing"""
-    try:
-        data, header = nrrd.read(filepath)
-        mask = (data > 0).astype(np.uint8)
-        labeled = label(mask)
-        props = regionprops(labeled)
-        if len(props) > 0:
-            largest_component = max(props, key=lambda x: x.area)
-            mask = (labeled == largest_component.label).astype(np.uint8)
-        mask_smooth = gaussian(mask.astype(float), sigma=0.5) > 0.5
-        skeleton = skeletonize(mask_smooth).astype(np.uint8)
-        points = np.argwhere(skeleton > 0)
-        print(f"{artery_name} artery: {len(points)} skeleton points after preprocessing")
-        spacing = extract_spacing(header)
-        print(f"Spacing (mm/voxel): {spacing}")
-        mask_float = mask.astype(np.float64)
-        dist_map = ndimage.distance_transform_edt(mask_float, sampling=spacing)
-        return mask, skeleton, points, dist_map, spacing
-    except Exception as e:
-        print(f"Error loading {artery_name} artery: {str(e)}")
-        return None, None, np.array([]), None, np.array([1, 1, 1])
+# Parametry detekcji zwężeń (Strategy: High Specificity)
+STENOSIS_WINDOW_MM = 15      # Stabilne tło
+STENOSIS_MIN_PCT = 25.0      # Próg kliniczny (eliminuje szum <25%)
+STENOSIS_MIN_LEN_MM = 3.0    # Kluczowy filtr szumu
+GRADIENT_THRESH = -0.15      # Bezpiecznik morfologiczny
+
+# NOWY PARAMETR: Ignorowanie zbyt małych naczyń
+STENOSIS_IGNORE_DIAMETER_MM = 1.5 
+# =================================================================
+
+# --- FUNKCJE POMOCNICZE ---
 
 def extract_spacing(header):
     if 'space directions' in header:
@@ -58,975 +52,620 @@ def extract_spacing(header):
     if 'spacing' in header and header['spacing'] is not None:
         spacing = header['spacing']
         return np.array([s if s is not None and not np.isnan(s) else 1.0 for s in spacing])
-    if 'space origin' in header and 'sizes' in header:
-        sizes = header['sizes']
-        if len(sizes) >= 3:
-            return np.array([0.5, 0.5, 0.5])
-    print("WARNING: Spacing not found in NRRD file, assuming 0.5mm/voxel")
     return np.array([0.5, 0.5, 0.5])
 
 def adaptive_diameter_calculation(p, dist_map, skeleton, points, spacing, base_window=7):
-    z, y, x = p
+    z, y, x = int(p[0]), int(p[1]), int(p[2])
+    if not (0 <= z < dist_map.shape[0] and 0 <= y < dist_map.shape[1] and 0 <= x < dist_map.shape[2]):
+        return 0.0
     initial_radius = dist_map[z, y, x]
+    if initial_radius <= 0.5: return 2 * initial_radius
     adaptive_window = max(3, min(base_window, int(initial_radius / min(spacing) + 1)))
-    z_start = max(0, z - adaptive_window)
-    z_end = min(dist_map.shape[0], z + adaptive_window + 1)
-    y_start = max(0, y - adaptive_window)
-    y_end = min(dist_map.shape[1], y + adaptive_window + 1)
-    x_start = max(0, x - adaptive_window)
-    x_end = min(dist_map.shape[2], x + adaptive_window + 1)
-    region = dist_map[z_start:z_end, y_start:y_end, x_start:x_end]
-    skel_region = skeleton[z_start:z_end, y_start:y_end, x_start:x_end]
-    skel_points_in_region = np.argwhere(skel_region > 0)
-    if len(skel_points_in_region) == 0:
-        return 2 * dist_map[z, y, x]
-    skel_points_abs = skel_points_in_region + np.array([z_start, y_start, x_start])
+    z_s, z_e = max(0, z - adaptive_window), min(dist_map.shape[0], z + adaptive_window + 1)
+    y_s, y_e = max(0, y - adaptive_window), min(dist_map.shape[1], y + adaptive_window + 1)
+    x_s, x_e = max(0, x - adaptive_window), min(dist_map.shape[2], x + adaptive_window + 1)
+    skel_region = skeleton[z_s:z_e, y_s:y_e, x_s:x_e]
+    skel_points_local = np.argwhere(skel_region > 0)
+    if len(skel_points_local) == 0: return 2 * dist_map[z, y, x]
+    skel_points_abs = skel_points_local + np.array([z_s, y_s, x_s])
     current_point = np.array([z, y, x])
-    distances_to_skel = np.linalg.norm(
-        (skel_points_abs - current_point) * spacing, axis=1
-    )
-    radius_threshold = 2.0
-    nearby_indices = distances_to_skel <= radius_threshold
-    if np.sum(nearby_indices) < 3:
-        nearby_indices = distances_to_skel <= 4.0
-    if np.sum(nearby_indices) == 0:
-        return 2 * dist_map[z, y, x]
-    nearby_skel_points = skel_points_abs[nearby_indices]
-    diameters = []
-    for skel_pt in nearby_skel_points:
-        sz, sy, sx = skel_pt
-        if 0 <= sz < dist_map.shape[0] and 0 <= sy < dist_map.shape[1] and 0 <= sx < dist_map.shape[2]:
-            radius = dist_map[sz, sy, sx]
-            if radius > 0:
-                diameters.append(2 * radius)
-    if len(diameters) == 0:
-        return 2 * dist_map[z, y, x]
-    return np.median(diameters)
+    distances = np.linalg.norm((skel_points_abs - current_point) * spacing, axis=1)
+    nearby_mask = distances <= 2.0
+    if np.sum(nearby_mask) < 3: nearby_mask = distances <= 4.0
+    nearby_pts = skel_points_abs[nearby_mask]
+    if len(nearby_pts) == 0: return 2 * dist_map[z, y, x]
+    radii = dist_map[nearby_pts[:,0], nearby_pts[:,1], nearby_pts[:,2]]
+    return np.median(radii) * 2
 
-def build_graph(points, skeleton, dist_map, spacing, artery_name,radius_voxels=1.5):
-    if len(points) == 0:
-        print(f"No points to build graph for {artery_name} artery")
-        return nx.Graph(), {}
-    point_to_id = {tuple(p): i for i, p in enumerate(points)}
-    G = nx.Graph()
+def linear_upsample_phys_points(phys_pts, factor=8):
+    if len(phys_pts) < 2: return phys_pts
+    segs = np.linalg.norm(np.diff(phys_pts, axis=0), axis=1)
+    total = np.sum(segs)
+    if total <= 0: return phys_pts
+    total_samples = max(100, len(phys_pts) * factor)
+    fine_pts = []
+    for i in range(len(phys_pts)-1):
+        a, b = phys_pts[i], phys_pts[i+1]
+        nseg = max(2, int(round(total_samples * (segs[i]/total))))
+        ts = np.linspace(0, 1, nseg, endpoint=False)
+        for t in ts: fine_pts.append(a + (b - a) * t)
+    fine_pts.append(phys_pts[-1])
+    return np.vstack(fine_pts)
 
-    for i, point in enumerate(points):
-        diameter = adaptive_diameter_calculation(point, dist_map, skeleton, points, spacing)
-        G.add_node(i, pos=point, diameter=diameter)
-
-    # Budujemy KDTree dla przyspieszenia wyszukiwania sąsiadów
-    scaled_points = points * spacing  # Przeskaluj do jednostek fizycznych (mm)
-    tree = cKDTree(scaled_points)
-
-    # Szukamy sąsiadów w promieniu `radius_voxels` (w mm)
-    neighbor_indices_list = tree.query_ball_tree(tree, r=radius_voxels * np.min(spacing) * 1.75)
-
-    for i, neighbors in enumerate(neighbor_indices_list):
-        for j in neighbors:
-            if i != j and not G.has_edge(i, j):
-                dist = np.linalg.norm(scaled_points[i] - scaled_points[j])
-                G.add_edge(i, j, weight=dist)
-    print(f"{artery_name} artery: graph has {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
-    return G, point_to_id
-
-def rolling_average(arr, window):
-    if window < 2:
-        return arr
-    return np.convolve(arr, np.ones(window)/window, mode='same')
-
-def detect_local_stenosis(diameters, spacing, window_mm=15, min_stenosis=30, min_length_pts=5):#
-    diameters = np.array(diameters)
-    n = len(diameters)
-    mean_spacing = np.mean(spacing)
-    window_pts = max(2, int(window_mm / mean_spacing))
-    stenosis_values = []
-    for i in range(n):
-        left = max(0, i - window_pts)
-        right = min(n, i + window_pts)
-        # Lokalna referencja: proksymalny fragment
-        region = diameters[left:i] if i > left else diameters[i+1:right]
-        if len(region) < 2:
-            stenosis_values.append(0)
-            continue
-        ref_diam = np.median(region)
-        stenosis = (1 - diameters[i] / ref_diam) * 100 if ref_diam > 0 else 0
-        stenosis = max(0, stenosis)
-        stenosis_values.append(stenosis)
-    # Szukanie regionów zwężeń
-    regions = []
-    current = []
-    for idx, sten in enumerate(stenosis_values):
-        if sten >= min_stenosis:
-            current.append((idx, sten))
-        else:
-            if len(current) >= min_length_pts:
-                max_sten = max(current, key=lambda x: x[1])
-                regions.append({
-                    'start_idx': current[0][0],
-                    'end_idx': current[-1][0],
-                    'length': len(current),
-                    'max_stenosis': max_sten[1],
-                    'max_stenosis_idx': max_sten[0]
-                })
-            current = []
-    if len(current) >= min_length_pts:
-        max_sten = max(current, key=lambda x: x[1])
-        regions.append({
-            'start_idx': current[0][0],
-            'end_idx': current[-1][0],
-            'length': len(current),
-            'max_stenosis': max_sten[1],
-            'max_stenosis_idx': max_sten[0]
-        })
-    return regions, stenosis_values
-
-def detect_local_stenosis(diameters, spacing, window_mm=15, min_stenosis=30, min_length_pts=5):
-    """
-    Detekcja lokalnych zwężeń na podstawie zmian średnicy naczynia.
-    Dodano filtrację fałszywych zwężeń na podstawie gradientu i głębokości spadku.
-    """
-    diameters = np.array(diameters)
-    n = len(diameters)
-    mean_spacing = np.mean(spacing)
-    window_pts = max(2, int(window_mm / mean_spacing))
-
-    stenosis_values = []
-    for i in range(n):
-        left = max(0, i - window_pts)
-        right = min(n, i + window_pts)
-
-        region = diameters[left:i] if i > left else diameters[i+1:right]
-        if len(region) < 2:
-            stenosis_values.append(0)
-            continue
-
-        ref_diam = np.median(region)
-        stenosis = (1 - diameters[i] / ref_diam) * 100 if ref_diam > 0 else 0
-        stenosis = max(0, stenosis)
-        stenosis_values.append(stenosis)
-
-    regions = []
-    current = []
-
-    for idx, sten in enumerate(stenosis_values):
-        if sten >= min_stenosis:
-            current.append((idx, sten))
-        else:
-            if len(current) >= min_length_pts:
-                max_sten = max(current, key=lambda x: x[1])
-                regions.append({
-                    'start_idx': current[0][0],
-                    'end_idx': current[-1][0],
-                    'length': len(current),
-                    'max_stenosis': max_sten[1],
-                    'max_stenosis_idx': max_sten[0]
-                })
-            current = []
-
-    if len(current) >= min_length_pts:
-        max_sten = max(current, key=lambda x: x[1])
-        regions.append({
-            'start_idx': current[0][0],
-            'end_idx': current[-1][0],
-            'length': len(current),
-            'max_stenosis': max_sten[1],
-            'max_stenosis_idx': max_sten[0]
-        })
-
-    grad = np.gradient(diameters)
-
-    filtered_regions = []
-    for region in regions:
-        start, end = region['start_idx'], region['end_idx']
-
-
-        region_grad_mean = np.mean(grad[start:end])
-
-        diameter_drop = np.max(diameters[start:end]) - np.min(diameters[start:end])
-
-        if region_grad_mean < -0.1:   
-            continue
-        if diameter_drop < 0.3:    
-            continue
-
-        filtered_regions.append(region)
-
-    return filtered_regions, stenosis_values
-
-
-def enhanced_visualization(path_points, diameters, stenosis_regions, artery_name):
-    distance_mm = np.arange(len(diameters)) * 0.5  # Przybliżona odległość
-    window_size = 9
-    diameters_smooth = rolling_average(np.array(diameters), window_size)
-    print(f"\n=== DETAILED ANALYSIS - {artery_name} ===")
-    print(f"Mean diameter: {np.mean(diameters_smooth):.2f} mm")
-    print(f"Min diameter: {np.min(diameters_smooth):.2f} mm")
-    print(f"Diameter variability (std): {np.std(diameters_smooth):.2f} mm")
-    print(f"Number of stenosis regions: {len(stenosis_regions)}")
-    for i, region in enumerate(stenosis_regions, 1):
-        print(f"Region {i}: stenosis {region['max_stenosis']:.1f}%, length {region['length']} points")
-
-# --- Wczytanie danych ---
-left_mask, left_skeleton, left_points, left_dist_map, left_spacing = load_artery(
-    r"C:\Users\PC\Desktop\INZYNIERKA\Test\Jedna\Jedna_1-Jedna-label.nrrd", "Left")
-
-right_mask, right_skeleton, right_points, right_dist_map, right_spacing = load_artery(
-    r"C:\Users\PC\Desktop\INZYNIERKA\Test\Dwie\Dwie_4-Dwie-label.nrrd", "Right")
-
-
-# --- Tworzenie grafów ---
-G_left, left_point_to_id = build_graph(left_points, left_skeleton, left_dist_map, left_spacing, "Left")
-G_right, right_point_to_id = build_graph(right_points, right_skeleton, right_dist_map, right_spacing, "Right")
-
-
-left_mesh = vedo.Volume(left_mask).isosurface().c('lightgreen').alpha(0.2)
-left_skel = vedo.Points(left_points, r=3, c='darkgreen')
-if right_mask is not None and np.any(right_mask):
-    right_mesh = vedo.Volume(right_mask.astype(np.uint8)).isosurface().c('lightblue').alpha(0.2)
-else:
-    right_mesh = None
-right_skel = vedo.Points(right_points, r=3, c='darkblue') if len(right_points) > 0 else None
-
-plt = vedo.Plotter(title="Kliknij 3 punkty: start, koniec1, koniec2\n[L]-lewa [P]-prawa [R]-reset",
-                   axes=1, bg='white', size=(1000, 800))
-objects = [left_mesh, left_skel]
-if right_mesh: objects.append(right_mesh)
-if right_skel: objects.append(right_skel)
-plt.show(objects, resetcam=True, interactive=False)
-
-selected_points_left = []
-selected_points_right = []
-visual_objects_left = []
-visual_objects_right = []
-
-selected_points_left = []
-selected_points_right = []
-visual_objects_left = []
-visual_objects_right = []
-stenosis_objects_left = []  
-stenosis_objects_right = []  
-removed_stenosis = []  
-cadrads_results = []   
-
-cursor_marker = None
-cursor_text = None
-
-all_points = np.vstack([left_points, right_points]) if len(left_points) and len(right_points) else (left_points if len(left_points) else right_points)
-all_tree = cKDTree(all_points) if len(all_points) else None
-
-def reset_selection(artery='all'):
-    global selected_points_left, selected_points_right
-    global visual_objects_left, visual_objects_right
-    global stenosis_objects_left, stenosis_objects_right
-    global left_mesh, left_skel, right_mesh, right_skel
-
-    if artery in ['left', 'all']:
-        for obj in visual_objects_left + stenosis_objects_left:
-            plt.remove(obj)
-        selected_points_left.clear()
-        visual_objects_left.clear()
-        stenosis_objects_left.clear()
-        print("[LEFT] Resetowano wybór i ścieżki.")
-
-    if artery in ['right', 'all']:
-        for obj in visual_objects_right + stenosis_objects_right:
-            plt.remove(obj)
-        selected_points_right.clear()
-        visual_objects_right.clear()
-        stenosis_objects_right.clear()
-        print("[RIGHT] Resetowano wybór i ścieżki.")
-
-    plt.clear()
-    left_mesh = vedo.Volume(left_mask).isosurface().c('lightgreen').alpha(0.2)
-    left_skel = vedo.Points(left_points, r=3, c='darkgreen')
-    if right_mask is not None and np.any(right_mask):
-        right_mesh = vedo.Volume(right_mask.astype(np.uint8)).isosurface().c('lightblue').alpha(0.2)
+def compute_upsampled_path(path_pts, spacing, upsample_factor=UPSAMPLE_FACTOR):
+    phys_pts = path_pts * spacing
+    if len(phys_pts) > 1:
+        segs = np.linalg.norm(np.diff(phys_pts, axis=0), axis=1)
+        cum_orig = np.concatenate(([0.0], np.cumsum(segs)))
     else:
-        right_mesh = None
-    right_skel = vedo.Points(right_points, r=3, c='darkblue') if len(right_points) > 0 else None
+        cum_orig = np.array([0.0])
+    fine_pts = linear_upsample_phys_points(phys_pts, factor=upsample_factor)
+    if len(fine_pts) > 1:
+        fine_segs = np.linalg.norm(np.diff(fine_pts, axis=0), axis=1)
+        cum_fine = np.concatenate(([0.0], np.cumsum(fine_segs)))
+    else:
+        cum_fine = np.array([0.0])
+    tree = cKDTree(fine_pts)
+    mapping_idx = np.array([int(tree.query(p)[1]) for p in phys_pts], dtype=int)
+    return phys_pts, cum_orig, fine_pts, cum_fine, mapping_idx
 
-    objects = [left_mesh, left_skel]
-    if right_mesh: objects.append(right_mesh)
-    if right_skel: objects.append(right_skel)
-    plt.add(objects)
-    plt.render()
-    print("Zresetowano scenę. Możesz ponownie wybierać punkty.")
+def plot_graph_thread(diams, cum_orig, diag, regions, title, save_path):
+    fig, ax1 = mplt.subplots(figsize=(10,4))
+    ax1.plot(cum_orig, diams, label='Diameter', color='blue')
+    ax1.plot(cum_orig, diag['d_smooth'], color='cyan', alpha=0.6, label='Smooth')
+    ax1.set_ylabel('Diameter [mm]', color='blue')
+    ax1.set_xlabel('Distance [mm]')
+    
+    ax2 = ax1.twinx()
+    ax2.plot(cum_orig, diag['grad'], color='red', linestyle='--', label='Gradient')
+    ax2.set_ylabel('Gradient [mm/mm]', color='red')
+    
+    for reg in regions:
+        s = cum_orig[reg['start_idx']]
+        e = cum_orig[reg['end_idx']]
+        color = 'red' 
+        ax1.axvspan(s, e, color=color, alpha=0.2)
 
-def evaluate_gradient(diameters, spacing):
-    """Analizuje gradient średnicy i zwraca trend oraz stabilność."""
-    grad = np.gradient(diameters)
-    mean_grad = np.mean(grad)
-    std_grad = np.std(grad)
-    return mean_grad, std_grad, grad
+    ax1.set_title(title)
+    fig.tight_layout()
+    mplt.savefig(save_path, dpi=150)
+    mplt.close(fig)
+    print(f"[PLOT] Saved to {save_path}")
 
-
-def optimize_stenosis_parameters(diameters, spacing, visualize=True):
-    """Testuje różne parametry (okno, min_length_pts, próg zwężenia) i wybiera najlepsze."""
-
-    best_params = None
-    best_score = np.inf
-    results = []
-
-    for w in range (5,30):
-        for m in range(3,10):
-            for t in range(15,30):
-                regions, _ = detect_local_stenosis(diameters, spacing, window_mm=w,
-                                                   min_stenosis=t, min_length_pts=m)
-                mean_grad, std_grad, _ = evaluate_gradient(diameters, spacing)
-
-                score = abs(mean_grad + 0.01) + std_grad
-                results.append((w, m, t, mean_grad, std_grad, len(regions), score))
-
-                if score < best_score:
-                    best_score = score
-                    best_params = (w, m, t)
-
-    if visualize:
-        print("\n=== GRADIENT OPTIMIZATION RESULTS ===")
-        print(f"\nOptimal parameters: window={best_params[0]}, min_pts={best_params[1]}, "
-              f"sten_th={best_params[2]}")
-
-    return best_params
-
-import numpy as np
-from itertools import groupby
-
-def rolling_average_vec(arr, window_pts):
-    if window_pts < 2:
-        return np.array(arr)
-    return np.convolve(arr, np.ones(window_pts)/window_pts, mode='same')
-
-def find_contiguous_regions(mask):
-    """Zwraca listę (start, end) indeksów dla kolejnych True w mask."""
-    regions = []
-    n = len(mask)
-    i = 0
-    while i < n:
-        if mask[i]:
-            start = i
-            while i < n and mask[i]:
-                i += 1
-            end = i-1
-            regions.append((start, end))
-        else:
-            i += 1
-    return regions
-
-from scipy.ndimage import gaussian_filter1d
-
-def detect_local_stenosis_with_grad(diameters, spacing,
-                                    window_mm=15, min_stenosis=30, min_length_pts=5,
-                                    use_gradient=False, grad_thresh=-0.1,
-                                    smooth_sigma_pts=1.0, combine_with_and=False):
-    """
-    Wersja rozszerzona: uwzględnia opcjonalnie spadek gradientu.
-    - diameters: list/np.array średnic [mm]
-    - spacing: 3-element array voxel spacing (mm) -> używamy mean_spacing
-    - window_mm: okno do lokalnej referencji (mm)
-    - min_stenosis: procentowy próg spadku [%]
-    - min_length_pts: minimalna liczba punktów aby region uznać za zwężenie
-    - use_gradient: jeśli True dodajemy warunek na gradient
-    - grad_thresh: próg gradientu (ujemny), np. -0.1 (mm/mm)
-    - smooth_sigma_pts: sigma do gaussian_filter1d użyte do wygładzenia przed gradientem (w punktach)
-    - combine_with_and: jeśli True -> wymagamy (pct_drop >= min_stenosis) AND (grad <= grad_thresh)
-                       jeśli False -> OR (bardziej czułe)
-    Returns: regions, diagnostics (pct_drop, grad, d_smooth, cond_pct, cond_grad, cond_combined)
-    """
-
+# =================================================================
+# 2. FUNKCJA DETEKCJI
+# =================================================================
+def detect_local_stenosis_with_grad(diameters, spacing, 
+                                  window_mm=15, 
+                                  min_stenosis=20, 
+                                  min_length_mm=3.0,  # Parametr w MM
+                                  use_gradient=False, 
+                                  grad_thresh=-0.15, 
+                                  x_positions=None):
+    
     diams = np.array(diameters, dtype=float)
     n = len(diams)
-    mean_spacing = float(np.mean(spacing)) if np.ndim(spacing) else float(spacing)
+    mean_spacing = float(np.mean(spacing))
     window_pts = max(1, int(round(window_mm / mean_spacing)))
-
-    # 1) Wygładź średnice do policzenia gradientu (małe sigma np.1-3)
-    if smooth_sigma_pts and smooth_sigma_pts > 0:
-        d_smooth = gaussian_filter1d(diams, sigma=smooth_sigma_pts, mode='nearest')
+    
+    d_smooth = gaussian_filter1d(diams, sigma=1.0, mode='nearest')
+    
+    if x_positions is not None and len(x_positions) == n:
+        grad = np.gradient(d_smooth, x_positions)
     else:
-        d_smooth = diams.copy()
+        grad = np.gradient(d_smooth) / mean_spacing
 
-    # 2) gradient (mm per mm)
-    grad = np.gradient(d_smooth) / mean_spacing
-
-    # 3) percent drop (lokalna referencja proksymalna tak jak wcześniej)
-    pct_drop = np.zeros(n, dtype=float)
+    pct_drop = np.zeros(n)
     for i in range(n):
         left = max(0, i - window_pts)
         right = min(n, i + window_pts + 1)
-        # proksymalna referencja
-        if i - left >= 2:
-            ref_region = diams[left:i]
-        elif right - i >= 2:
-            ref_region = diams[i+1:right]
-        else:
-            ref_region = diams[max(0, i-window_pts):min(n, i+window_pts+1)]
-        if len(ref_region) >= 1:
+        ref_region = diams[left:right]
+        if len(ref_region) > 0:
             ref_val = np.median(ref_region)
-            pct_drop[i] = (1 - diams[i] / ref_val) * 100 if ref_val > 0 else 0
-        else:
-            pct_drop[i] = 0
+            pct_drop[i] = (1 - diams[i]/ref_val)*100 if ref_val > 0 else 0
 
-    # 4) warunki
     cond_pct = pct_drop >= min_stenosis
-    cond_grad = grad <= grad_thresh if use_gradient else np.zeros_like(cond_pct, dtype=bool)
-
-    if use_gradient:
-        if combine_with_and:
-            cond_combined = cond_pct & cond_grad
-        else:
-            cond_combined = cond_pct | cond_grad
-    else:
-        cond_combined = cond_pct
-
-    # 5) grupuj ciągłe regiony i filtruj po minimalnej długości
-    def find_regions(mask):
-        regions = []
-        i = 0
-        while i < len(mask):
-            if mask[i]:
-                start = i
-                while i < len(mask) and mask[i]:
-                    i += 1
-                end = i - 1
-                regions.append((start, end))
-            else:
-                i += 1
-        return regions
-
-    raw_regions = find_regions(cond_combined)
     regions = []
-    for (start, end) in raw_regions:
-        length = end - start + 1
-        if length >= min_length_pts:
-            max_idx = start + int(np.argmax(pct_drop[start:end+1]))
-            regions.append({
-                'start_idx': int(start),
-                'end_idx': int(end),
-                'length': int(length),
-                'max_stenosis': float(np.max(pct_drop[start:end+1])),
-                'max_stenosis_idx': int(max_idx)
-            })
+    
+    if np.any(cond_pct):
+        diff = np.diff(np.concatenate(([0], cond_pct.view(np.int8), [0])))
+        starts = np.where(diff == 1)[0]
+        ends = np.where(diff == -1)[0] - 1
+        
+        for s, e in zip(starts, ends):
+            if x_positions is not None:
+                real_length_mm = x_positions[e] - x_positions[s]
+            else:
+                real_length_mm = (e - s + 1) * mean_spacing
 
-    diagnostics = {
-        'd_smooth': d_smooth,
-        'grad': grad,
-        'pct_drop': pct_drop,
-        'cond_pct': cond_pct,
-        'cond_grad': cond_grad,
-        'cond_combined': cond_combined
-    }
+            if real_length_mm >= min_length_mm:
+                is_valid = True
+                if use_gradient:
+                    search_start = max(0, s - 3) 
+                    search_end = min(n, e + 1)
+                    local_grads = grad[search_start:search_end]
+                    if len(local_grads) > 0:
+                        steepest_drop = np.min(local_grads)
+                        if steepest_drop > grad_thresh:
+                            is_valid = False
+                    else:
+                        is_valid = False
 
+                if is_valid:
+                    sub_drop = pct_drop[s:e+1]
+                    max_idx_local = np.argmax(sub_drop)
+                    
+                    # Obliczamy średnią średnicę w tym zwężeniu (dla weryfikacji <1.5mm)
+                    avg_diameter_in_lesion = np.mean(diams[s:e+1])
+                    
+                    regions.append({
+                        'start_idx': int(s),
+                        'end_idx': int(e),
+                        'length_mm': float(real_length_mm),
+                        'max_stenosis': float(np.max(sub_drop)),
+                        'max_stenosis_idx': int(s + max_idx_local),
+                        'avg_diameter': float(avg_diameter_in_lesion) # Dodajemy info o średnicy
+                    })
+                
+    diagnostics = {'d_smooth': d_smooth, 'grad': grad, 'pct_drop': pct_drop}
     return regions, diagnostics
 
+# ================= KLASY =================
 
-def plot_diameter_gradient_with_regions(diams, spacing, title, diagnostics=None, regions=None):
-    mean_grad, std_grad, grad = evaluate_gradient(diams, spacing)
-    dist = np.arange(len(diams)) * np.mean(spacing)
+class Artery:
+    def __init__(self, name, filepath):
+        self.name = name
+        self.filepath = filepath
+        self.mask = None
+        self.skeleton = None
+        self.points = np.array([])
+        self.dist_map = None
+        self.spacing = np.array([0.5, 0.5, 0.5])
+        self.graph = nx.Graph()
+        self.tree = None
+        self.bifurcations = ([], np.empty((0,3)))
+        self.mesh = None
+        self.skel_actor = None
+        self.loaded = False
 
-    fig, ax1 = mplt.subplots(figsize=(10,4))
-    ax1.plot(dist, diams, label='Diameter [mm]', color='blue')
-    ax1.set_xlabel('Path length [mm]')
-    ax1.set_ylabel('Diameter [mm]', color='blue')
-    ax1.tick_params(axis='y', labelcolor='blue')
-
-    ax2 = ax1.twinx()
-    ax2.plot(dist, grad, label='Gradient [mm/mm]', color='red', linestyle='--')
-    ax2.set_ylabel('Gradient', color='red')
-    ax2.tick_params(axis='y', labelcolor='red')
-
-    if diagnostics is not None:
-
-        pct = diagnostics.get('pct_drop')
-        if pct is not None:
-            ax1.plot(dist, diagnostics['d_smooth'], color='cyan', alpha=0.6, label='Smoothed Diam')
-            ax1_twin = ax1.twinx()
-            ax1_twin.plot(dist, pct, color='magenta', linestyle=':', label='% drop')
-            ax1_twin.set_ylabel('% drop', color='magenta')
-            ax1_twin.tick_params(axis='y', labelcolor='magenta')
-
-        if regions:
-            for reg in regions:
-                start = reg['start_idx'] * np.mean(spacing)
-                end = reg['end_idx'] * np.mean(spacing)
-                ax1.axvspan(start, end, color='red', alpha=0.15)
-
-    ax1.set_title(title)
-    ax1.grid(True)
-    fig.tight_layout()
-    mplt.close(fig)
-
-
-def find_nearest_node(points, query_point):
-    if len(points) == 0:
-        return None, None
-    scaled = points  
-    dists = np.linalg.norm(scaled - query_point, axis=1)
-    idx = np.argmin(dists)
-    return idx, points[idx]
-
-
-def nearest_node_index_on_graph(points, query_point):
-    idx, pt = find_nearest_node(points, query_point)
-    return idx
-
-
-def handle_click(event):
-    global removed_stenosis
-    if not event.actor or event.keypress:
-        return
-
-    clicked_pos = event.picked3d
-    if clicked_pos is None:
-        return
-
-    all_stenosis = stenosis_objects_left + stenosis_objects_right
-    if all_stenosis:
-        stenosis_positions = [np.array(s.pos()) for s in all_stenosis]
-        tree = cKDTree(stenosis_positions)
-        indices = tree.query_ball_point(clicked_pos, r=10.0)
-
-        if indices:
-            distances = [np.linalg.norm(np.array(all_stenosis[i].pos()) - clicked_pos) for i in indices]
-            closest_idx = indices[np.argmin(distances)]
-            closest_stenosis = all_stenosis[closest_idx]
-
-            removed_stenosis.append({
-                'position': closest_stenosis.pos(),
-                'artery': 'left' if closest_stenosis in stenosis_objects_left else 'right',
-                'time_removed': time.time(),
-                'color': closest_stenosis.color, 
-                'radius': closest_stenosis.radius, 
-                'alpha': closest_stenosis.alpha  
-            })
-
-            plt.remove(closest_stenosis)
-            if closest_stenosis in stenosis_objects_left:
-                stenosis_objects_left.remove(closest_stenosis)
+    def load(self):
+        print(f"Loading {self.name} from {self.filepath}...")
+        try:
+            data, header = nrrd.read(self.filepath)
+            self.spacing = extract_spacing(header)
+            mask_raw = (data > 0).astype(np.uint8)
+            labeled = label(mask_raw)
+            props = regionprops(labeled)
+            if props:
+                largest = max(props, key=lambda x: x.area)
+                self.mask = (labeled == largest.label).astype(np.uint8)
             else:
-                stenosis_objects_right.remove(closest_stenosis)
-            print(f"Usunięto znacznik zwężenia w {closest_stenosis.pos()}")
-            plt.render()
+                self.mask = mask_raw
+
+            mask_smooth = gaussian(self.mask.astype(float), sigma=0.5) > 0.5
+            self.skeleton = skeletonize(mask_smooth).astype(np.uint8)
+            self.points = np.argwhere(self.skeleton > 0)
+            self.dist_map = ndimage.distance_transform_edt(self.mask.astype(float), sampling=self.spacing)
+            
+            if len(self.points) > 0:
+                self.tree = cKDTree(self.points)
+            
+            self.loaded = True
+            print(f" -> {self.name}: {len(self.points)} points, spacing {self.spacing}")
+            
+            self._build_graph()
+            self._detect_bifurcations()
+            
+        except Exception as e:
+            print(f"ERROR loading {self.name}: {e}")
+            self.loaded = False
+
+    def _build_graph(self):
+        if len(self.points) == 0: return
+        G = nx.Graph()
+        for i in range(len(self.points)):
+            G.add_node(i, pos=self.points[i])
+        
+        radius_search_vox = 2.5 
+        neighbors_list = self.tree.query_ball_tree(self.tree, r=radius_search_vox)
+        
+        scaled_pts = self.points * self.spacing
+        for i, neighbors in enumerate(neighbors_list):
+            for j in neighbors:
+                if i < j:
+                    dist = np.linalg.norm(scaled_pts[i] - scaled_pts[j])
+                    G.add_edge(i, j, weight=dist)
+        self.graph = G
+
+    def _detect_bifurcations(self):
+        if len(self.points) == 0: return
+        pts_set = {tuple(p) for p in self.points}
+        offsets = [(dz, dy, dx) for dz in (-1,0,1) for dy in (-1,0,1) for dx in (-1,0,1) if not (dz==0 and dy==0 and dx==0)]
+        candidates = []
+        for idx, p in enumerate(self.points):
+            z,y,x = int(p[0]), int(p[1]), int(p[2])
+            neigh = 0
+            for off in offsets:
+                if (z+off[0], y+off[1], x+off[2]) in pts_set: neigh += 1
+            if neigh >= 3: candidates.append(idx)
+        if not candidates: return
+        cand_phys = self.points[candidates] * self.spacing
+        tree = cKDTree(cand_phys)
+        groups = tree.query_ball_tree(tree, r=BIFURCATION_MERGE_RADIUS_MM)
+        visited = set()
+        bif_indices = []
+        bif_locs = []
+        for i in range(len(candidates)):
+            if i in visited: continue
+            cluster = []
+            stack = [i]
+            while stack:
+                curr = stack.pop()
+                if curr in visited: continue
+                visited.add(curr)
+                cluster.append(curr)
+                for n in groups[curr]:
+                    if n not in visited: stack.append(n)
+            glob_indices = [candidates[x] for x in cluster]
+            phys_cluster = self.points[glob_indices] * self.spacing
+            centroid = np.mean(phys_cluster, axis=0)
+            dists = np.linalg.norm(phys_cluster - centroid, axis=1)
+            rep_idx = glob_indices[np.argmin(dists)]
+            bif_indices.append(rep_idx)
+            bif_locs.append(centroid)
+        self.bifurcations = (bif_indices, np.vstack(bif_locs) if bif_locs else np.empty((0,3)))
+
+    def get_vedos(self, color_mesh, color_skel):
+        if not self.loaded: return []
+        if self.mesh is None:
+            self.mesh = vedo.Volume(self.mask).isosurface().c(color_mesh).alpha(0.2)
+        if self.skel_actor is None:
+            self.skel_actor = vedo.Points(self.points, r=3, c=color_skel)
+        return [self.mesh, self.skel_actor]
+
+class AnalyzerApp:
+    def __init__(self, left_path, right_path):
+        self.left = Artery("Left", left_path)
+        self.right = Artery("Right", right_path)
+        
+        self.selected_pts = {'left': [], 'right': []} 
+        self.visuals = {'left': [], 'right': [], 'stenosis': []}
+        self.stenosis_results = []
+        
+        self.cursor_sphere = None
+        self.cursor_text = None
+        
+        self.plt = vedo.Plotter(title="Analiza Tetnic | [R] Reset", 
+                                axes=1, bg='white', size=(1200, 900))
+        
+        self.left.load()
+        self.right.load()
+        
+        actors = []
+        actors.extend(self.left.get_vedos('lightgreen', 'darkgreen'))
+        actors.extend(self.right.get_vedos('lightblue', 'darkblue'))
+        self.plt.add(actors)
+        
+        self.status_text = vedo.Text2D("Wybierz punkty:\nLewa (L): 3 pkt\nPrawa (P): 2 pkt", 
+                                     pos='top-left', s=0.8, bg='yellow', alpha=0.5)
+        self.plt.add(self.status_text)
+
+        self.plt.add_callback('LeftButtonPress', self.on_click)
+        self.plt.add_callback('MouseMove', self.on_move)
+        self.plt.add_callback('KeyPress', self.on_key)
+
+    def run(self):
+        self.plt.show(resetcam=True, interactive=True)
+
+    def reset(self, side='all'):
+        print(f"Resetting {side}...")
+        sides = ['left', 'right'] if side == 'all' else [side]
+        for s in sides:
+            self.plt.remove(self.visuals[s])
+            self.visuals[s] = []
+            self.selected_pts[s] = []
+        
+        if side == 'all':
+            self.plt.remove(self.visuals['stenosis'])
+            self.visuals['stenosis'] = []
+            self.stenosis_results = []
+            self.status_text.text("Zresetowano. Wybierz punkty.")
+            
+        self.plt.render()
+
+    def determine_segment_name(self, current_dist, sorted_bifurcation_dists):
+        if not sorted_bifurcation_dists: return "Segment"
+        tolerance = 2.0 
+        if current_dist < (sorted_bifurcation_dists[0] + tolerance): return "Proximal"
+        if len(sorted_bifurcation_dists) > 1:
+            if current_dist < (sorted_bifurcation_dists[1] + tolerance): return "Mid"
+            else: return "Distal"
+        return "Distal"
+
+    def calculate_paths(self, artery_obj, side_key):
+        pts_indices = self.selected_pts[side_key]
+        start_node = pts_indices[0]
+        end_nodes = pts_indices[1:]
+        
+        print(f"\n--- ANALIZA: {artery_obj.name} ---")
+        self.status_text.text(f"Przetwarzanie {artery_obj.name}...")
+        self.plt.render()
+        
+        path_counter = 1
+        for end_node in end_nodes:
+            try:
+                path_idxs = nx.shortest_path(artery_obj.graph, start_node, end_node)
+            except nx.NetworkXNoPath:
+                print(f"Brak ścieżki w grafie {artery_obj.name}!")
+                continue
+
+            path_pts = artery_obj.points[path_idxs]
+            
+            # Obliczamy średnice
+            diameters = []
+            for p in path_pts:
+                d = adaptive_diameter_calculation(p, artery_obj.dist_map, artery_obj.skeleton, 
+                                                artery_obj.points, artery_obj.spacing)
+                diameters.append(d)
+            
+            # Wygładzamy średnice, żeby "szum" nie wyznaczył błędnego punktu odcięcia
+            diameters_smooth = gaussian_filter1d(diameters, sigma=2.0)
+
+            _, cum_orig, _, _, _ = compute_upsampled_path(path_pts, artery_obj.spacing)
+            
+            # =========================================================
+            # 1. WYZNACZANIE PUNKTU ODCIĘCIA (CUT-OFF) 1.5 mm
+            # =========================================================
+            # Szukamy od końca punktu, gdzie naczynie jest jeszcze "grube" (>1.5mm)
+            valid_end_idx = len(diameters) - 1 # Domyślnie cała ścieżka ważna
+            
+            # Idziemy od tyłu
+            for i in range(len(diameters) - 1, -1, -1):
+                if diameters_smooth[i] >= STENOSIS_IGNORE_DIAMETER_MM:
+                    valid_end_idx = i
+                    break # Znaleźliśmy punkt, gdzie naczynie robi się "istotne"
+            
+            valid_end_dist = cum_orig[valid_end_idx]
+            print(f" -> Punkt odcięcia dystalnego (<{STENOSIS_IGNORE_DIAMETER_MM}mm): {valid_end_dist:.1f} mm")
+            
+            # Zaznaczamy ten punkt na wykresie 3D (opcjonalnie - np. szara kulka)
+            cutoff_pos = path_pts[valid_end_idx]
+            cutoff_sph = vedo.Sphere(cutoff_pos, r=2.0, c='gray').alpha(0.5)
+            self.plt.add(cutoff_sph)
+            self.visuals[side_key].append(cutoff_sph)
+            # =========================================================
+
+            regions, diag = detect_local_stenosis_with_grad(
+                diameters, artery_obj.spacing,
+                window_mm=STENOSIS_WINDOW_MM,
+                min_stenosis=STENOSIS_MIN_PCT,
+                min_length_mm=STENOSIS_MIN_LEN_MM,
+                use_gradient=True,
+                grad_thresh=GRADIENT_THRESH,
+                x_positions=cum_orig
+            )
+            
+            line = vedo.Line(path_pts).lw(6)
+            line.cmap('jet', diameters) 
+            
+            if path_counter == 1:
+                if side_key == 'left':
+                    pos_coords = ((0.05, 0.05), (0.20, 0.25))
+                else:
+                    pos_coords = ((0.80, 0.05), (0.95, 0.25))
+                line.add_scalarbar(title=f"Srednica {artery_obj.name} [mm]", pos=pos_coords)
+            
+            self.plt.add(line)
+            self.visuals[side_key].append(line)
+            
+            path_bifs_dist = []
+            all_bif_indices, _ = artery_obj.bifurcations
+            node_to_dist = {node: dist for node, dist in zip(path_idxs, cum_orig)}
+            
+            for bif_idx in all_bif_indices:
+                if bif_idx in node_to_dist:
+                    path_bifs_dist.append(node_to_dist[bif_idx])
+            path_bifs_dist.sort()
+            
+            print(f"\n[Sciezka {path_counter}] Dlugosc: {cum_orig[-1]:.1f} mm")
+
+            for reg in regions:
+                start_idx = reg['start_idx']
+                start_dist = cum_orig[start_idx]
+                
+                ignored = False
+                
+                # 1. Filtr Bifurkacji
+                for bd in path_bifs_dist:
+                    if bd <= start_dist and (start_dist - bd) <= BIFURCATION_BUFFER_MM:
+                        ignored = True; break
+                
+                # 2. Filtr Dystalnego Odcięcia (NOWY)
+                if not ignored:
+                    # Jeśli początek zwężenia jest DALEJ niż punkt odcięcia -> Ignoruj
+                    if start_idx > valid_end_idx:
+                        print(f" -> [IGNOROWANE] Zwężenie w końcówce dystalnej (Poz: {start_dist:.1f}mm > Cutoff: {valid_end_dist:.1f}mm)")
+                        ignored = True
+                
+                if not ignored:
+                    sten_val = reg['max_stenosis']
+                    seg_name = self.determine_segment_name(start_dist, path_bifs_dist)
+                    
+                    print(f" -> ZWEZENIE ({seg_name}): {sten_val:.1f}% | Poz: {start_dist:.1f}mm")
+
+                    idx_local = reg['max_stenosis_idx']
+                    pos_3d = path_pts[idx_local]
+                    sph = vedo.Sphere(pos_3d, r=3.5, c='red').alpha(0.8)
+                    self.plt.add(sph)
+                    self.visuals['stenosis'].append(sph)
+
+                    self.stenosis_results.append({
+                        'artery': artery_obj.name,
+                        'path': path_counter,
+                        'side': 'L' if side_key=='left' else 'P',
+                        'segment': seg_name,
+                        'stenosis': sten_val
+                    }) 
+
+            save_dir = "gradient_analysis"
+            os.makedirs(save_dir, exist_ok=True)
+            plot_graph_thread(diameters, cum_orig, diag, regions, 
+                              f"{artery_obj.name} Path {path_counter}", 
+                              f"{save_dir}/{artery_obj.name}_path{path_counter}.png")
+            
+            path_counter += 1
+        
+        print(f"Zakonczono analize {artery_obj.name}.")
+        self.status_text.text(f"Gotowe: {artery_obj.name}. Wyniki w konsoli.")
+        self.cadrads_calc()
+        self.plt.render()
+
+    def cadrads_calc(self):
+        if not self.stenosis_results: return
+        
+        print("\n" + "="*40)
+        print("     RAPORT ZWĘŻEŃ (Wsparcie Decyzji)")
+        print("="*40)
+        print(f"{'Naczynie':<10} | {'Segment':<10} | {'Zwężenie [%]':<12} | {'Klasa'}")
+        print("-" * 50)
+
+        for res in self.stenosis_results:
+            s = res['stenosis']
+            cls_suggestion = "1-2"
+            if s >= 70: cls_suggestion = "4A (High)"
+            elif s >= 50: cls_suggestion = "3 (Mod)"
+            elif s >= 25: cls_suggestion = "2 (Mild)"
+            
+            print(f"{res['artery']:<10} | {res['segment']:<10} | {s:5.1f}%       | {cls_suggestion}")
+
+        print("-" * 50)
+        print("\n[!!!] UWAGA KLINICZNA / DISCLAIMER:")
+        print("Algorytm analizuje wyłącznie geometrię drożnego światła naczynia.")
+        print("Wykryte zwężenia (np. 50-60%) mogą towarzyszyć całkowitej OKLUZJI (100%)")
+        print("w innym segmencie, której program geometryczny może nie wykryć.")
+        print("\nZALECENIE: Weryfikacja wizualna pod kątem CAD-RADS 5 (Total Occlusion).")
+        print("="*40 + "\n")
+
+    def on_click(self, event):
+        if not event.actor or event.keypress: return
+        click_pos = event.picked3d
+        if click_pos is None: return
+
+        if self.visuals['stenosis']:
+            st_pos = [np.array(s.pos()) for s in self.visuals['stenosis']]
+            if not st_pos: return
+            tree = cKDTree(st_pos)
+            d, idx = tree.query(click_pos)
+            if d < 8.0: 
+                removed = self.visuals['stenosis'].pop(idx)
+                self.plt.remove(removed)
+                print("Usunięto manualnie znacznik zwężenia.")
+                self.plt.render()
+                return
+
+        dist_l = np.inf
+        dist_r = np.inf
+        idx_l, idx_r = -1, -1
+        
+        if self.left.loaded:
+            dist_l, idx_l = self.left.tree.query(click_pos)
+        if self.right.loaded:
+            dist_r, idx_r = self.right.tree.query(click_pos)
+        
+        if min(dist_l, dist_r) > 15.0: return 
+
+        target = self.left if dist_l < dist_r else self.right
+        side_key = 'left' if dist_l < dist_r else 'right'
+        max_pts = 3 if side_key == 'left' else 2
+        
+        final_idx = idx_l if dist_l < dist_r else idx_r
+
+        if len(self.selected_pts[side_key]) >= max_pts:
+            print(f"Limit punktów! Resetuj.")
             return
 
-
-    distances_left = np.linalg.norm(left_points - clicked_pos, axis=1) if len(left_points) else [np.inf]
-    distances_right = np.linalg.norm(right_points - clicked_pos, axis=1) if len(right_points) else [np.inf]
-    min_left_dist = np.min(distances_left)
-    min_right_dist = np.min(distances_right)
-
-
-    if min_left_dist > 5.0 and min_right_dist > 5.0:
-        print("Kliknięto zbyt daleko od tętnic. Wybierz punkt bliżej szkieletu.")
-        return
-
-    if min_left_dist < min_right_dist:
-        artery = 'left'
-        points = left_points
-        selected_points = selected_points_left
-        visual_objects = visual_objects_left
-        G = G_left
-        dist_map = left_dist_map
-        skeleton = left_skeleton
-        spacing = left_spacing
-        max_points = 3
-    else:
-        artery = 'right'
-        points = right_points
-        selected_points = selected_points_right
-        visual_objects = visual_objects_right
-        G = G_right
-        dist_map = right_dist_map
-        skeleton = right_skeleton
-        spacing = right_spacing
-        max_points = 2
-
-    if len(selected_points) >= max_points:
-        print(f"Uwaga: Osiągnięto maks. liczbę punktów ({max_points}) dla tętnicy {artery}.")
-        print("Kliknij 'L' aby zresetować lewą tętnicę, 'P' dla prawej, lub 'R' aby zresetować wszystko.")
-        return
-
-    distances = np.linalg.norm(points - clicked_pos, axis=1)
-    closest_idx = np.argmin(distances)
-    closest_point = points[closest_idx]
-
-    if closest_idx in selected_points:
-        print(f"Punkt {closest_idx} został już wybrany. Wybierz inny punkt.")
-        return
-
-    selected_points.append(closest_idx)
-
-    colors = ['green', 'red', 'orange'] if artery == 'left' else ['green', 'red']
-    point_color = colors[len(selected_points) - 1]
-    point_sphere = vedo.Sphere(pos=closest_point, r=1.5, c=point_color)
-    plt.add(point_sphere)
-    visual_objects.append(point_sphere)
-    print(f"[{artery.upper()}] Dodano punkt: Indeks {closest_idx}, Współrzędne {closest_point}")
-
-    if (artery == 'left' and len(selected_points) == 3) or (artery == 'right' and len(selected_points) == 2):
-        find_paths(artery, G, points, selected_points, visual_objects, dist_map, skeleton, spacing)
-
-
-def find_paths(artery, G, points, selected_points, visual_objects, dist_map, skeleton, spacing):
-    if (artery == 'left' and len(selected_points) < 3) or (artery == 'right' and len(selected_points) < 2):
-        print(f"Za mało punktów dla tętnicy {artery}.")
-        return
-
-    start_idx = selected_points[0]
-    end1_idx = selected_points[1]
-    end2_idx = selected_points[2] if artery == 'left' else None
-
-    def path_diameter_report(path, points, dist_map, skeleton, spacing):
-        diameters = []
-        for idx in path:
-            p = points[idx]
-            diam = adaptive_diameter_calculation(p, dist_map, skeleton, points, spacing)
-            diameters.append(diam)
-        return diameters
-
-    try:
-        path1 = nx.shortest_path(G, start_idx, end1_idx)
-        path1_points = points[path1]
-        diams1 = path_diameter_report(path1, points, dist_map, skeleton, spacing)
-        line1 = vedo.Line(path1_points)
-        line1.cmap('viridis', diams1)
-        line1.lw(8)
-        if artery == 'left':
-            line1.add_scalarbar(title="Srednica lewej tetnicy [mm]", pos=((0, 0.05), (0.1, 0.35)))
-        elif artery == 'right':
-            line1.add_scalarbar(title="Srednica prawej tetnicy [mm]", pos=((0.85, 0.05), (0.95, 0.35)))
-        plt.add(line1)
-        visual_objects.append(line1)
-        print(f"[{artery.upper()}] Ścieżka 1: {len(path1)} punktów")
-        print("Średnice na ścieżce 1 (mm):", np.round(diams1, 2))
-
-        regions1, diag1 = detect_local_stenosis_with_grad(
-            diams1, spacing,
-            window_mm=15, min_stenosis=30, min_length_pts=6,
-            use_gradient=True, grad_thresh=-0.1,
-            smooth_sigma_pts=1.5, combine_with_and=False
-        )
-
-        print(f"\n[{artery.upper()}] Analiza gradientu dla ścieżki 1:")
-        opt_params = optimize_stenosis_parameters(diams1, spacing, visualize=True)
-
-        threading.Thread(target=plot_diameter_gradient_with_regions(diams1, spacing, artery + " - Path 1", diagnostics=diag1, regions=regions1)).start()
-
-        paths_data.append({
-            "artery": artery,
-            "id": "1",
-            "diameters": diams1,
-            "spacing": spacing
-        })
-
-
-        if regions1:
-            enhanced_visualization(path1_points, diams1, regions1, artery + " - Ścieżka 1")
-            for region in regions1:
-                sten_point = points[path1[region['max_stenosis_idx']]]
-                sten_sphere = vedo.Sphere(pos=sten_point, r=3.0, c='red').alpha(0.5)
-                sten_sphere.pickable(True) 
-                plt.add(sten_sphere)
-                if artery == 'left':
-                    stenosis_objects_left.append(sten_sphere)
-                else:
-                    stenosis_objects_right.append(sten_sphere)
-        else:
-            print(f"[{artery.upper()}] Nie znaleziono istotnych zwężeń dla ścieżki 1")
-
-    except nx.NetworkXNoPath:
-        print(f"[{artery.upper()}] Nie znaleziono ścieżki 1")
-
-    if artery == 'left':
-        try:
-            path2 = nx.shortest_path(G, start_idx, end2_idx)
-            path2_points = points[path2]
-            diams2 = path_diameter_report(path2, points, dist_map, skeleton, spacing)
-            line2 = vedo.Line(path2_points)
-            line2.cmap('viridis', diams2)
-            line2.lw(8)
-            plt.add(line2)
-            visual_objects.append(line2)
-            print(f"[{artery.upper()}] Ścieżka 2: {len(path2)} punktów")
-            print("Średnice na ścieżce 2 (mm):", np.round(diams2, 2))
-
-            regions2, diag2 = detect_local_stenosis_with_grad(
-                diams2, spacing,
-                window_mm=15, min_stenosis=30, min_length_pts=6,
-                use_gradient=True, grad_thresh=-0.1,
-                smooth_sigma_pts=1.5, combine_with_and=False
-            )
-                    # === TEST PARAMETRÓW I GRADIENT ===
-            print(f"\n[{artery.upper()}] Analiza gradientu dla ścieżki 2:")
-            opt_params2 = optimize_stenosis_parameters(diams2, spacing, visualize=True)
-            threading.Thread(target=plot_diameter_gradient_with_regions(diams2, spacing, artery + " - Path 1", diagnostics=diag2, regions=regions2)).start()
-
-            paths_data.append({
-                "artery": artery,
-                "id": "2",
-                "diameters": diams2,
-                "spacing": spacing
-            })
-
-            if regions2:
-                enhanced_visualization(path2_points, diams2, regions2, artery + " - Ścieżka 2")
-                for region in regions2:
-                    sten_point = points[path2[region['max_stenosis_idx']]]
-                    sten_sphere = vedo.Sphere(pos=sten_point, r=1.5, c='red')
-                    plt.add(sten_sphere)
-                    stenosis_objects_left.append(sten_sphere)
-            else:
-                print(f"[{artery.upper()}] Nie znaleziono istotnych zwężeń dla ścieżki 2")
-
-            if 'path1' in locals() and 'path2' in locals():
-                common_length = min(len(path1), len(path2))
-                branch_point_idx = 0
-                for i in range(common_length):
-                    if path1[i] != path2[i]:
-                        break
-                    branch_point_idx = i
-                branch_point = points[path1[branch_point_idx]]
-                branch_sphere = vedo.Sphere(pos=branch_point, r=1, c='purple')
-                plt.add(branch_sphere)
-                visual_objects.append(branch_sphere)
-                print(f"[{artery.upper()}] Punkt rozgałęzienia: {branch_point}")
-        except nx.NetworkXNoPath:
-            print(f"[{artery.upper()}] Nie znaleziono ścieżki 2")
-
-    plt.render()
-
-
-def on_mouse_move(event):
-    for obj in stenosis_objects_left + stenosis_objects_right:
-        obj.color('red').alpha(0.7) 
-
-    if event.actor and (event.actor in stenosis_objects_left or event.actor in stenosis_objects_right):
-        event.actor.color('yellow').alpha(0.9) 
-        plt.render()
-
-
-def reload_removed_stenosis():
-    global stenosis_objects_left, stenosis_objects_right
-
-    for stenosis in removed_stenosis:
-        sten_sphere = vedo.Sphere(
-            pos=stenosis['position'],
-            r=stenosis['radius']
-        ).color(stenosis['color']).alpha(stenosis['alpha'])
-
-        if stenosis['artery'] == 'left':
-            stenosis_objects_left.append(sten_sphere)
-        else:
-            stenosis_objects_right.append(sten_sphere)
-
-        plt.add(sten_sphere)
-
-    removed_stenosis.clear()
-    plt.render()
-
-def calculate_cadrads():
-    global cadrads_results
-
-    current_stenosis = []
-    for obj in stenosis_objects_left:
-        current_stenosis.append({'artery': 'left', 'position': obj.pos()})
-    for obj in stenosis_objects_right:
-        current_stenosis.append({'artery': 'right', 'position': obj.pos()})
-
-    cadrads_score = "CAD-RADS 0"
-    if len(current_stenosis) > 0:
-        if len(current_stenosis) >= 3:
-            cadrads_score = "CAD-RADS 4B"
-        elif len(current_stenosis) >= 1:
-            cadrads_score = "CAD-RADS 3"
-
-    report = {
-        'timestamp': time.strftime("%Y-%m-%d %H:%M:%S"),
-        'total_stenosis': len(current_stenosis),
-        'left_artery': len(stenosis_objects_left),
-        'right_artery': len(stenosis_objects_right),
-        'cadrads_score': cadrads_score,
-        'details': current_stenosis
-    }
-
-    cadrads_results.append(report)
-    return report
-
-def show_cadrads_report():
-    if not cadrads_results:
-        print("Brak danych do wygenerowania raportu CAD-RADS")
-        return
-
-    latest_report = cadrads_results[-1]
-
-    report_text = f"""
-    ===== RAPORT CAD-RADS =====
-    Data: {latest_report['timestamp']}
-    Laczna liczba zwezen: {latest_report['total_stenosis']}
-    - Lewa tetnica: {latest_report['left_artery']}
-    - Prawa tetnica: {latest_report['right_artery']}
-    Ocena CAD-RADS: {latest_report['cadrads_score']}
-    """
-
-    print(report_text)
-
-    txt = vedo.Text2D(report_text, pos='top-left', c='k', bg='y', alpha=0.8)
-    plt.add(txt).render()
-
-def on_mouse_move(event):
-    global cursor_marker, cursor_text
-    for obj in stenosis_objects_left + stenosis_objects_right:
-        try:
-            obj.color('red').alpha(0.6)
-        except Exception:
-            pass
-
-    if event.actor and (event.actor in stenosis_objects_left or event.actor in stenosis_objects_right):
-        event.actor.color('yellow').alpha(0.9)
-
-    picked3d = event.picked3d
-    if picked3d is None:
-        return
-
-    global all_tree
-    if all_tree is None:
-        return
-    dist, idx = all_tree.query(picked3d)
-    if dist > 10.0:
-        if cursor_marker:
-            plt.remove(cursor_marker)
-            cursor_marker = None
-        if cursor_text:
-            plt.remove(cursor_text)
-            cursor_text = None
-        plt.render()
-        return
-
-    nearest_pt = all_points[idx]
-
-    if len(left_points) and np.any(np.all(nearest_pt == left_points, axis=1)):
-        pt_idx = np.where(np.all(nearest_pt == left_points, axis=1))[0][0]
-        diam = adaptive_diameter_calculation(left_points[pt_idx], left_dist_map, left_skeleton, left_points, left_spacing)
-    else:
-        pt_idx = np.where(np.all(nearest_pt == right_points, axis=1))[0][0]
-        diam = adaptive_diameter_calculation(right_points[pt_idx], right_dist_map, right_skeleton, right_points, right_spacing)
-
-    if cursor_marker:
-        plt.remove(cursor_marker)
-    cursor_marker = vedo.Sphere(pos=nearest_pt, r=1.2, c='white').alpha(0.9)
-    plt.add(cursor_marker)
-
-    if cursor_text:
-        plt.remove(cursor_text)
-    txt = f"D={diam:.2f} mm\npt={nearest_pt.tolist()}"
-    cursor_text = vedo.Text2D(txt, pos='top-left', c='k', bg='w', alpha=0.8)
-    plt.add(cursor_text)
-
-    plt.render()
-
-
-def handle_keypress(event):
-    if event.keypress == 'r':  
-        reset_selection('all')
-    elif event.keypress == 'l':   
-        reload_removed_stenosis()
-    elif event.keypress == 'c':   
-        calculate_cadrads()
-        show_cadrads_report()
-
-plt.add_callback('LeftButtonPress', handle_click)
-plt.add_callback('MouseMove', on_mouse_move)
-plt.add_callback("KeyPress", handle_keypress)
-plt.interactive().close()
-
-import os
-from scipy.ndimage import gaussian_filter1d
-
-def analyze_gradients_after_close(paths_data):
-    """
-    Analizuje wszystkie ścieżki po zamknięciu okna Vedo:
-    - testuje różne parametry (window, min_pts, sten_th),
-    - wybiera najlepsze,
-    - pokazuje wygładzoną krzywą gradientu i średnicy,
-    - zapisuje wykresy do folderu.
-    """
-    if not paths_data:
-        print("[INFO] Brak danych ścieżek do analizy.")
-        return
-
-    os.makedirs("gradient_analysis", exist_ok=True)
-    print("\n=== ROZPOCZYNAM ANALIZĘ ŚCIEŻEK ===")
-
-    for path_info in paths_data:
-        artery = path_info["artery"]
-        pid = path_info["id"]
-        diam = np.array(path_info["diameters"])
-        spacing = np.array(path_info["spacing"], dtype=float)
-
-        def evaluate_params(d, spacing, window, min_pts, sten_th):
-            regs, _ = detect_local_stenosis(d, spacing=spacing,
-                                            window_mm=window,
-                                            min_stenosis=sten_th,
-                                            min_length_pts=min_pts)
-            grad = np.gradient(d)
-            mean_grad = np.mean(grad)
-            std_grad = np.std(grad)
-            score = abs(mean_grad + 0.01) + std_grad + 0.02 * max(0, len(regs) - 3)
-            return {"regs": regs, "score": score, "mean_grad": mean_grad, "std_grad": std_grad}
-
-        best = {"score": np.inf}
-        for w in [10, 15, 20, 25, 30]:
-            for m in [4, 5, 6, 7]:
-                for t in [20, 25, 30]:
-                    res = evaluate_params(diam, spacing, w, m, t)
-                    if res["score"] < best["score"]:
-                        best = res | {"window": w, "min_pts": m, "sten_th": t}
-
-        dist = np.arange(len(diam)) * np.mean(spacing)
-        grad = np.gradient(diam)
-        grad_smooth = gaussian_filter1d(grad, sigma=2)
-        diam_smooth = gaussian_filter1d(diam, sigma=1)
-
-        fig, ax1 = mplt.subplots(figsize=(10, 4))
-        ax1.plot(dist, diam_smooth, 'b-', label="Diameter [mm]")
-        ax1.set_xlabel("Path length [mm]")
-        ax1.set_ylabel("Diameter [mm]", color='b')
-        ax1.tick_params(axis='y', labelcolor='b')
-
-        ax2 = ax1.twinx()
-        ax2.plot(dist, grad_smooth, 'r--', label="Gradient (smoothed)")
-        ax2.set_ylabel("Gradient", color='r')
-        ax2.tick_params(axis='y', labelcolor='r')
-
-        #for r in best["regs"]:
-         #   ax1.axvspan(dist[r['start_idx']], dist[r['end_idx']], color='red', alpha=0.15)
-
-        ax1.set_title(f"{artery.upper()} - Path {pid}")
-        fig.tight_layout()
-        save_path = f"gradient_analysis/{artery}_path{pid}.png"
-        mplt.savefig(save_path, dpi=150)
-        print(f"[SAVED] {save_path}")
-        mplt.close(fig)
-
-
-    print("\n=== ANALIZA ZAKOŃCZONA ===")
-
-analyze_gradients_after_close(paths_data)
-
-import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
-import os
-
-def preview_all_plots(folder="gradient_analysis"):
-    imgs = [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".png")]
-    if not imgs:
-        print("[INFO] No saved plots found.")
-        return
-    for img in imgs:
-        image = mpimg.imread(img)
-        plt.figure(figsize=(10, 4))
-        plt.imshow(image)
-        plt.axis('off')
-        plt.title(os.path.basename(img))
-        plt.show()
-
-# Na samym końcu programu:
-preview_all_plots()
+        if final_idx in self.selected_pts[side_key]: return
+        
+        self.selected_pts[side_key].append(final_idx)
+        pt_coord = target.points[final_idx]
+        
+        colors = ['green', 'yellow', 'orange']
+        col = colors[len(self.selected_pts[side_key])-1]
+        sph = vedo.Sphere(pt_coord, r=2.5, c=col)
+        self.plt.add(sph)
+        self.visuals[side_key].append(sph)
+        
+        print(f"[{target.name}] Punkt {len(self.selected_pts[side_key])}/{max_pts}")
+
+        if len(self.selected_pts[side_key]) == max_pts:
+            self.calculate_paths(target, side_key)
+            
+        self.plt.render()
+
+    def on_move(self, event):
+        if event.picked3d is None:
+            if self.cursor_sphere: 
+                self.plt.remove(self.cursor_sphere)
+                self.cursor_sphere = None
+            if self.cursor_text: 
+                self.plt.remove(self.cursor_text)
+                self.cursor_text = None
+            self.plt.render()
+            return
+
+        pos = event.picked3d
+        
+        d_left, idx_left = self.left.tree.query(pos) if self.left.tree else (np.inf, -1)
+        d_right, idx_right = self.right.tree.query(pos) if self.right.tree else (np.inf, -1)
+        
+        if min(d_left, d_right) > 10.0:
+            if self.cursor_sphere: 
+                self.plt.remove(self.cursor_sphere)
+                self.cursor_sphere = None
+            if self.cursor_text:
+                self.plt.remove(self.cursor_text)
+                self.cursor_text = None
+            self.plt.render()
+            return
+
+        target_artery = self.left if d_left < d_right else self.right
+        target_idx = idx_left if d_left < d_right else idx_right
+        
+        voxel_pt = target_artery.points[target_idx]
+        z,y,x = int(voxel_pt[0]), int(voxel_pt[1]), int(voxel_pt[2])
+        diam = 0.0
+        if (0 <= z < target_artery.dist_map.shape[0] and 
+            0 <= y < target_artery.dist_map.shape[1] and 
+            0 <= x < target_artery.dist_map.shape[2]):
+            diam = target_artery.dist_map[z,y,x] * 2.0
+
+        if self.cursor_sphere: 
+            self.plt.remove(self.cursor_sphere)
+        
+        self.cursor_sphere = vedo.Sphere(pos=voxel_pt, r=1.5, c='white', alpha=0.5)
+        self.plt.add(self.cursor_sphere)
+        
+        if self.cursor_text: 
+            self.plt.remove(self.cursor_text)
+        
+        self.cursor_text = vedo.Text2D(f"{target_artery.name}\nD={diam:.2f} mm", pos='top-left', c='black', bg='white')
+        self.plt.add(self.cursor_text)
+        
+        self.plt.render()
+
+    def on_key(self, event):
+        if event.keypress == 'r': self.reset('all')
+        elif event.keypress == 'l': self.reset('left')
+        elif event.keypress == 'p': self.reset('right')
+
+# ================= MAIN =================
+if __name__ == "__main__":
+    # ZMIEŃ ŚCIEŻKI DO SWOICH PLIKÓW
+    LEFT_FILE = r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 4\Segmentation_left.nrrd"
+    RIGHT_FILE = r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 4\Segmentation_right.nrrd"
+
+    if not os.path.exists(LEFT_FILE): print(f"UWAGA: Brak {LEFT_FILE}")
+    if not os.path.exists(RIGHT_FILE): print(f"UWAGA: Brak {RIGHT_FILE}")
+
+    app = AnalyzerApp(LEFT_FILE, RIGHT_FILE)
+    app.run()

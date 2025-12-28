@@ -1,344 +1,464 @@
-import nrrd
 import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
 import networkx as nx
-from skimage.morphology import skeletonize
-import vedo
-from scipy import ndimage
 from scipy.ndimage import gaussian_filter1d
 
-def load_artery(filepath, artery_name):
-    try:
-        data, header = nrrd.read(filepath)
-        mask = (data > 0).astype(np.uint8)
-        skeleton = skeletonize(mask).astype(np.uint8)
-        points = np.argwhere(skeleton > 0)
-        print(f"{artery_name} tętnica: {len(points)} punktów szkieletu")
+# =============================================================================
+# IMPORTY Z PLIKU GŁÓWNEGO
+# =============================================================================
 
-        # --- Odczytaj spacing ---
-        if 'space directions' in header:
-            spacing = np.array([np.linalg.norm(v) for v in header['space directions']])
-        elif 'spacing' in header:
-            spacing = np.array(header['spacing'])
+from gradient2 import Artery, compute_upsampled_path, adaptive_diameter_calculation, detect_local_stenosis_with_grad
+
+
+# =============================================================================
+# 1. KONFIGURACJA OSTATECZNA (TWOJE ZŁOTE PARAMETRY)
+# =============================================================================
+FINAL_WINDOW = 11.0
+FINAL_LEN    = 3.0
+FINAL_PCT    = 24.0
+FINAL_GRAD   = -0.19
+
+TOLERANCE_MM = 10.0 # Margines błędu lokalizacji (np. +/- 1 cm)
+
+# =============================================================================
+# 2. DANE PACJENTÓW (KOMPLETNE)
+# =============================================================================
+PATIENTS = {
+    "P1 (CAD 0)": [
+        {"name": "RCA", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 0\Segmentation_right.nrrd", "start_node": 329, "end_node": 595, "true_stenoses_mm": []},
+        {"name": "LAD", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 0\Segmentation_left.nrrd", "start_node": 0, "end_node": 328, "true_stenoses_mm": []},
+        {"name": "LCx", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 0\Segmentation_left.nrrd", "start_node": 0, "end_node": 163, "true_stenoses_mm": []}
+    ],
+    "P2 (CAD 1)": [
+        {"name": "RCA", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 1\Segmentation_right.nrrd", "start_node": 398, "end_node": 705, "true_stenoses_mm": []},
+        {"name": "LAD", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 1\Segmentation_left.nrrd", "start_node": 10, "end_node": 779, "true_stenoses_mm": []},
+        {"name": "LCx", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 1\Segmentation_left.nrrd", "start_node": 0, "end_node": 1014, "true_stenoses_mm": []}
+    ],
+    "P3 (CAD 2)": [
+        {"name": "RCA", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 2\Segmentation_right.nrrd", "start_node": 275, "end_node": 463, "true_stenoses_mm": []},
+        {"name": "LAD", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 2\Segmentation_left.nrrd", "start_node": 1, "end_node": 239, "true_stenoses_mm": []},
+        {"name": "LCx", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 2\Segmentation_left.nrrd", "start_node": 1, "end_node": 612, "true_stenoses_mm": []}
+    ],
+    "P4 (CAD 3)": [
+        {"name": "RCA", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 3\Segmentation_right.nrrd", "start_node": 323, "end_node": 515, "true_stenoses_mm": []},
+        {"name": "LAD", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 3\Segmentation_left.nrrd", "start_node": 0, "end_node": 669, "true_stenoses_mm": [55.6]},
+        {"name": "LCx", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 3\Segmentation_left.nrrd", "start_node": 0, "end_node": 775, "true_stenoses_mm": [90.6]}
+    ],
+    "P5 (CAD 4)": [
+        {"name": "RCA", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 4\Segmentation_right.nrrd", "start_node": 298, "end_node": 462, "true_stenoses_mm": [0.0,117.8,152.4]}, # Okluzja
+        {"name": "LAD", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 4\Segmentation_left.nrrd", "start_node": 0, "end_node": 460, "true_stenoses_mm": [10.7]},
+        {"name": "LCx", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 4\Segmentation_left.nrrd", "start_node": 0, "end_node": 184, "true_stenoses_mm": []}
+    ],
+    "P6 (CAD 5)": [
+        {"name": "RCA", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 5\Segmentation_right.nrrd", "start_node": 325, "end_node": 647, "true_stenoses_mm": [46.9]},
+        {"name": "LAD", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 5\Segmentation_left.nrrd", "start_node": 0, "end_node": 499, "true_stenoses_mm": [45.7, 83.4]},
+        {"name": "LCx", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 5\Segmentation_left.nrrd", "start_node": 0, "end_node": 265, "true_stenoses_mm": []}
+    ],
+    "P7 (CAD 3v2)": [
+        {"name": "RCA", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 3v2\Segmentation_right.nrrd", "start_node": 314, "end_node": 610, "true_stenoses_mm": [1.3]},
+        {"name": "LAD", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 3v2\Segmentation_left.nrrd", "start_node": 0, "end_node": 625, "true_stenoses_mm": [18.6, 56.9]},
+        {"name": "LCx", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 3v2\Segmentation_left.nrrd", "start_node": 0, "end_node": 990, "true_stenoses_mm": [29.6,39.7]}
+    ],
+    "P8 (CAD 4v2)": [
+        {"name": "RCA", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 4v2\Segmentation_right.nrrd", "start_node": 183, "end_node": 360, "true_stenoses_mm": [5.0, 30.5, 90.7]},
+        {"name": "LAD", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 4v2\Segmentation_left.nrrd", "start_node": 0, "end_node": 527, "true_stenoses_mm": [8.4, 41.6, 88.2]},
+        {"name": "LCx", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 4v2\Segmentation_left.nrrd", "start_node": 0, "end_node": 357, "true_stenoses_mm": []}
+    ],
+    "P9 (CAD 5v2)": [
+        {"name": "RCA", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 5v2\Segmentation_right.nrrd", "start_node": 210, "end_node": 409, "true_stenoses_mm": [32.4, 124.7]},
+        {"name": "LAD", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 5v2\Segmentation_left.nrrd", "start_node": 59, "end_node": 594, "true_stenoses_mm": [98.7]},
+        {"name": "LCx", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 5v2\Segmentation_left.nrrd", "start_node": 59, "end_node": 857, "true_stenoses_mm": []}
+    ],
+    "P10 (CAD 3_4)": [
+        {"name": "RCA", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 3_4\Segmentation_right.nrrd", "start_node": 599, "end_node": 868, "true_stenoses_mm": [21.6, 36.4, 89.0, 110.7]},
+        {"name": "LAD", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 3_4\Segmentation_left.nrrd", "start_node": 0, "end_node": 185, "true_stenoses_mm": [48.0, 84.7]},
+        {"name": "LCx", "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 3_4\Segmentation_left.nrrd", "start_node": 0, "end_node": 518, "true_stenoses_mm": []}
+    ],
+                "P11 (CAD 0v2)": [
+        { 
+            "name": "RCA", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 0v2\Segmentation_right.nrrd", 
+            "start_node": 194, 
+            "end_node": 231, 
+            "true_stenoses_mm": [] 
+        },
+        { 
+            "name": "LAD", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 0v2\Segmentation_left.nrrd", 
+            "start_node": 0, 
+            "end_node": 310, 
+            "true_stenoses_mm": [] 
+        },
+        { 
+            "name": "LCx", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 0v2\Segmentation_left.nrrd", 
+            "start_node": 0, 
+            "end_node": 323, 
+            "true_stenoses_mm": [] 
+        }
+    ],
+            "P12 (CAD 0v3)": [
+        { 
+            "name": "RCA", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 0v3\Segmentation_right.nrrd", 
+            "start_node": 252, 
+            "end_node": 29, 
+            "true_stenoses_mm": [] 
+        },
+        { 
+            "name": "LAD", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 0v3\Segmentation_left.nrrd", 
+            "start_node": 32, 
+            "end_node": 357, 
+            "true_stenoses_mm": [] 
+        },
+        { 
+            "name": "LCx", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 0v3\Segmentation_left.nrrd", 
+            "start_node": 32, 
+            "end_node": 0, 
+            "true_stenoses_mm": [] 
+        }
+    ],
+                "P13 (CAD 1v2)": [
+        { 
+            "name": "RCA", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 1v2\Segmentation_right.nrrd", 
+            "start_node": 297, 
+            "end_node": 737, 
+            "true_stenoses_mm": [] 
+        },
+        { 
+            "name": "LAD", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 1v2\Segmentation_left.nrrd", 
+            "start_node": 0, 
+            "end_node": 395, 
+            "true_stenoses_mm": [] 
+        },
+        { 
+            "name": "LCx", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 1v2\Segmentation_left.nrrd", 
+            "start_node": 0, 
+            "end_node": 328, 
+            "true_stenoses_mm": [] 
+        }
+    ],
+                "P14 (CAD 1v3)": [
+        { 
+            "name": "RCA", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 1v3\Segmentation_right.nrrd", 
+            "start_node": 441, 
+            "end_node": 793, 
+            "true_stenoses_mm": [] 
+        },
+        { 
+            "name": "LAD", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 1v3\Segmentation_left.nrrd", 
+            "start_node": 1, 
+            "end_node": 652, 
+            "true_stenoses_mm": [] 
+        },
+        { 
+            "name": "LCx", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 1v3\Segmentation_left.nrrd", 
+            "start_node": 1, 
+            "end_node": 388, 
+            "true_stenoses_mm": [] 
+        }
+    ],
+                "P15 (CAD 2v2)": [
+        { 
+            "name": "RCA", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 2v2\Segmentation_right.nrrd", 
+            "start_node": 312, 
+            "end_node": 402, 
+            "true_stenoses_mm": [59.9] 
+        },
+        { 
+            "name": "LAD", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 2v2\Segmentation_left.nrrd", 
+            "start_node": 2, 
+            "end_node": 403, 
+            "true_stenoses_mm": [] 
+        },
+        { 
+            "name": "LCx", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 2v2\Segmentation_left.nrrd", 
+            "start_node": 2, 
+            "end_node": 244, 
+            "true_stenoses_mm": [] 
+        }
+    ],
+                "P16 (CAD 2v3)": [
+        { 
+            "name": "RCA", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 2v3\Segmentation_right.nrrd", 
+            "start_node": 588, 
+            "end_node": 812, 
+            "true_stenoses_mm": [96.8] 
+        },
+        { 
+            "name": "LAD", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 2v3\Segmentation_left.nrrd", 
+            "start_node": 0, 
+            "end_node": 820, 
+            "true_stenoses_mm": [35.0,70.6] 
+        },
+        { 
+            "name": "LCx", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 2v3\Segmentation_left.nrrd", 
+            "start_node": 0, 
+            "end_node": 686, 
+            "true_stenoses_mm": [2.8] 
+        }
+    ],
+                "P17 (CAD 3v3)": [
+        { 
+            "name": "RCA", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 3v3\Segmentation_right.nrrd", 
+            "start_node": 543, 
+            "end_node": 26, 
+            "true_stenoses_mm": [] 
+        },
+        { 
+            "name": "LAD", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 3v3\Segmentation_left.nrrd", 
+            "start_node": 163, 
+            "end_node": 715, 
+            "true_stenoses_mm": [36.2] 
+        },
+        { 
+            "name": "LCx", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 3v3\Segmentation_left.nrrd", 
+            "start_node": 163, 
+            "end_node": 0, 
+            "true_stenoses_mm": [] 
+        }
+    ],
+                "P18 (CAD 3v4)": [
+        { 
+            "name": "RCA", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 3v4\Segmentation_right.nrrd", 
+            "start_node": 479, 
+            "end_node": 972, 
+            "true_stenoses_mm": [] 
+        },
+        { 
+            "name": "LAD", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 3v4\Segmentation_left.nrrd", 
+            "start_node": 0, 
+            "end_node": 963, 
+            "true_stenoses_mm": [52.9,81.5] 
+        },
+        { 
+            "name": "LCx", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 3v4\Segmentation_left.nrrd", 
+            "start_node": 0, 
+            "end_node": 874, 
+            "true_stenoses_mm": [56.3,70.5] 
+        }
+    ],
+                "P19 (CAD 4v3)": [
+        { 
+            "name": "RCA", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 4v3\Segmentation_right.nrrd", 
+            "start_node": 540, 
+            "end_node": 672, 
+            "true_stenoses_mm": [38.1,106.2,131.9] 
+        },
+        { 
+            "name": "LAD", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 4v3\Segmentation_left.nrrd", 
+            "start_node": 0, 
+            "end_node": 721, 
+            "true_stenoses_mm": [] 
+        },
+        { 
+            "name": "LCx", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 4v3\Segmentation_left.nrrd", 
+            "start_node": 0, 
+            "end_node": 956, 
+            "true_stenoses_mm": [] 
+        }
+    ],
+                "P20 (CAD 5v3)": [
+        { 
+            "name": "RCA", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 5v3\Segmentation_right.nrrd", 
+            "start_node": 450, 
+            "end_node": 529, 
+            "true_stenoses_mm": [62.7] 
+        },
+        { 
+            "name": "LAD", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 5v3\Segmentation_left.nrrd", 
+            "start_node": 0, 
+            "end_node": 758, 
+            "true_stenoses_mm": [32] 
+        },
+        { 
+            "name": "LCx", 
+            "file_path": r"C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\CADRADS 5v3\Segmentation_left.nrrd", 
+            "start_node": 0, 
+            "end_node": 925, 
+            "true_stenoses_mm": [19.7,36.7] 
+        }
+    ],
+}
+
+# =============================================================================
+# 3. SILNIK WALIDACJI
+# =============================================================================
+def validate_all_patients():
+    stats = []
+    print("=== ROZPOCZYNAM WALIDACJĘ KOŃCOWĄ ===")
+    print(f"Parametry: Win={FINAL_WINDOW}, Len={FINAL_LEN}, Pct={FINAL_PCT}, Grad={FINAL_GRAD}\n")
+
+    for pid, arteries in PATIENTS.items():
+        print(f"-> Analiza pacjenta: {pid}")
+        
+        # Statystyki per pacjent
+        p_tp, p_fp, p_fn = 0, 0, 0
+        total_ground_truth = 0
+        
+        for conf in arteries:
+            if not os.path.exists(conf['file_path']):
+                print(f"   [!] Brak pliku: {conf['name']}")
+                continue
+                
+            try:
+                # 1. Obliczenia
+                a = Artery("X", conf['file_path'])
+                a.load()
+                if not (conf['start_node'] in a.graph and conf['end_node'] in a.graph): continue
+                
+                path_idxs = nx.shortest_path(a.graph, conf['start_node'], conf['end_node'])
+                path_pts = a.points[path_idxs]
+                diams = [adaptive_diameter_calculation(p, a.dist_map, a.skeleton, a.points, a.spacing) for p in path_pts]
+                _, cum_orig, _, _, _ = compute_upsampled_path(path_pts, a.spacing)
+                
+                # 2. Detekcja
+                regions, _ = detect_local_stenosis_with_grad(
+                    diams, a.spacing,
+                    window_mm=FINAL_WINDOW,
+                    min_stenosis=FINAL_PCT,
+                    min_length_mm=FINAL_LEN,
+                    use_gradient=True,
+                    grad_thresh=FINAL_GRAD,
+                    x_positions=cum_orig
+                )
+                
+                # 3. Porównanie z Ground Truth
+                detected_mm = [cum_orig[r['max_stenosis_idx']] for r in regions]
+                true_mm = conf['true_stenoses_mm'].copy()
+                total_ground_truth += len(true_mm)
+                
+                # Matching
+                local_tp = 0
+                local_fp = 0
+                
+                for det_pos in detected_mm:
+                    match_found = False
+                    for t_pos in true_mm:
+                        if abs(det_pos - t_pos) <= TOLERANCE_MM:
+                            match_found = True
+                            true_mm.remove(t_pos) # Usunięcie trafionego
+                            break
+                    
+                    if match_found: local_tp += 1
+                    else: local_fp += 1
+                
+                local_fn = len(true_mm) # To co zostało, to przeoczenia
+                
+                p_tp += local_tp
+                p_fp += local_fp
+                p_fn += local_fn
+                
+            except Exception as e:
+                print(f"   [!] Błąd w {conf['name']}: {e}")
+
+        # Obliczenie metryk dla pacjenta
+        precision = p_tp / (p_tp + p_fp) if (p_tp + p_fp) > 0 else 0
+        recall = p_tp / (p_tp + p_fn) if (p_tp + p_fn) > 0 else 0
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+        
+        # Obsługa pacjentów zdrowych (dzielenie przez zero)
+        if total_ground_truth == 0:
+            status = "HEALTHY"
+            # Jeśli zdrowy i FP=0 -> F1=1.0 (Sukces)
+            # Jeśli zdrowy i FP>0 -> F1=0.0 (Fałszywy alarm)
+            f1 = 1.0 if p_fp == 0 else 0.0
         else:
-            spacing = np.array([1.0, 1.0, 1.0])  # fallback
-            print(f"UWAGA: Nie znaleziono spacing w pliku NRRD dla {artery_name}, zakładam 1mm/voxel")
+            status = "DISEASED"
 
-        # Odległość od ściany w mm
-        spacing = np.array(spacing, dtype=np.float64)
-        mask_float = mask.astype(np.float64)
-        dist_map = ndimage.distance_transform_edt(mask_float, sampling=spacing)
-        return mask, skeleton, points, dist_map, spacing
-    except Exception as e:
-        print(f"Błąd ładowania {artery_name} tętnicy: {str(e)}")
-        return None, None, np.array([]), None, np.array([1,1,1])
+        stats.append({
+            "Patient": pid,
+            "Type": status,
+            "GT (Prawda)": total_ground_truth,
+            "TP (Trafienia)": p_tp,
+            "FP (Fałszywe)": p_fp,
+            "FN (Przeoczone)": p_fn,
+            "F1-Score": round(f1, 2)
+        })
 
-def local_average_diameter(p, dist_map, window=3):
-    z, y, x = p
-    region = dist_map[max(0, z-window):z+window+1,
-                      max(0, y-window):y+window+1,
-                      max(0, x-window):x+window+1]
-    valid = region[region > 0]
-    if len(valid) < 5:
-        return 2 * dist_map[tuple(p)]
-    return 2 * np.mean(valid)
+    return pd.DataFrame(stats)
 
-left_mask, left_skeleton, left_points, left_dist_map, left_spacing = load_artery(
-    r"C:\Users\student.VIRMED\Desktop\Slicer_JM\CADRADS 1\Segmentation_left.nrrd.nrrd", "Lewa")
-right_mask, right_skeleton, right_points, right_dist_map, right_spacing = load_artery(
-    r"C:\Users\student.VIRMED\Desktop\Slicer_JM\CADRADS 1\Segmentation_right.nrrd.nrrd", "Prawa")
+# =============================================================================
+# 4. RYSOWANIE I RAPORT
+# =============================================================================
+if __name__ == "__main__":
+    df = validate_all_patients()
+    
+    print("\n" + "="*80)
+    print("SZCZEGÓŁOWY RAPORT WALIDACJI")
+    print("="*80)
+    print(df.to_string(index=False))
+    
+    # Obliczenie średnich
+    avg_f1 = df["F1-Score"].mean()
+    total_tp = df["TP (Trafienia)"].sum()
+    total_fp = df["FP (Fałszywe)"].sum()
+    total_fn = df["FN (Przeoczone)"].sum()
+    
+    # Global Precision/Recall
+    gl_prec = total_tp / (total_tp + total_fp) if (total_tp+total_fp) > 0 else 0
+    gl_rec = total_tp / (total_tp + total_fn) if (total_tp+total_fn) > 0 else 0
+    gl_f1 = 2 * (gl_prec * gl_rec) / (gl_prec + gl_rec) if (gl_prec+gl_rec) > 0 else 0
 
-# --- Odległość od ściany (dla średnicy) ---
-left_dist_map = ndimage.distance_transform_edt(left_mask)
-right_dist_map = ndimage.distance_transform_edt(right_mask) if right_mask is not None else None
-
-# --- Tworzenie grafów ---
-def build_graph(points, skeleton, artery_name):
-    if len(points) == 0:
-        print(f"Brak punktów do budowy grafu dla {artery_name} tętnicy")
-        return nx.Graph(), {}
-    point_to_id = {tuple(p): i for i, p in enumerate(points)}
-    G = nx.Graph()
-    for i, point in enumerate(points):
-        point = tuple(point)
-        for dz in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                for dx in [-1, 0, 1]:
-                    if dz == 0 and dy == 0 and dx == 0:
-                        continue
-                    neighbor = (point[0] + dz, point[1] + dy, point[2] + dx)
-                    if neighbor in point_to_id:
-                        G.add_edge(point_to_id[point], point_to_id[neighbor])
-    print(f"{artery_name} tętnica: graf ma {G.number_of_nodes()} węzłów i {G.number_of_edges()} krawędzi")
-    return G, point_to_id
-
-G_left, left_point_to_id = build_graph(left_points, left_skeleton, "Lewa")
-G_right, right_point_to_id = build_graph(right_points, right_skeleton, "Prawa")
-
-# --- Wizualizacja, zmienne globalne ---
-global left_mesh, left_skel, right_mesh, right_skel
-
-left_mesh = vedo.Volume(left_mask).isosurface().c('lightgreen').alpha(0.2)
-left_skel = vedo.Points(left_points, r=3, c='darkgreen')
-if right_mask is not None and np.any(right_mask):
-    right_mesh = vedo.Volume(right_mask.astype(np.uint8)).isosurface().c('lightblue').alpha(0.2)
-else:
-    right_mesh = None
-right_skel = vedo.Points(right_points, r=3, c='darkblue') if len(right_points) > 0 else None
-
-plt = vedo.Plotter(title="Kliknij 3 punkty: start, koniec1, koniec2\n[L]-lewa [P]-prawa [R]-reset",
-                   axes=1, bg='white', size=(1000, 800))
-objects = [left_mesh, left_skel]
-if right_mesh: objects.append(right_mesh)
-if right_skel: objects.append(right_skel)
-plt.show(objects, resetcam=True, interactive=False)
-
-selected_points_left = []
-selected_points_right = []
-visual_objects_left = []
-visual_objects_right = []
-
-def reset_selection(artery='all'):
-    global selected_points_left, selected_points_right
-    global visual_objects_left, visual_objects_right
-    global left_mesh, left_skel, right_mesh, right_skel
-
-    if artery in ['left', 'all']:
-        for obj in visual_objects_left:
-            plt.remove(obj)
-        selected_points_left.clear()
-        visual_objects_left.clear()
-        print("[LEFT] Resetowano wybory i ścieżki.")
-
-    if artery in ['right', 'all']:
-        for obj in visual_objects_right:
-            plt.remove(obj)
-        selected_points_right.clear()
-        visual_objects_right.clear()
-        print("[RIGHT] Resetowano wybory i ścieżki.")
-
-    plt.clear()
-    left_mesh = vedo.Volume(left_mask).isosurface().c('lightgreen').alpha(0.2)
-    left_skel = vedo.Points(left_points, r=3, c='darkgreen')
-    if right_mask is not None and np.any(right_mask):
-        right_mesh = vedo.Volume(right_mask.astype(np.uint8)).isosurface().c('lightblue').alpha(0.2)
-    else:
-        right_mesh = None
-    right_skel = vedo.Points(right_points, r=3, c='darkblue') if len(right_points) > 0 else None
-    objects = [left_mesh, left_skel]
-    if right_mesh: objects.append(right_mesh)
-    if right_skel: objects.append(right_skel)
-    plt.add(objects)
-    plt.render()
-    print("Scena została całkowicie zresetowana. Możesz ponownie wybierać punkty.")
-
-def handle_click(event):
-    if not event.actor or event.keypress:
-        return
-    clicked_pos = event.picked3d
-    if clicked_pos is None:
-        return
-    distances_left = np.linalg.norm(left_points - clicked_pos, axis=1) if len(left_points) else [np.inf]
-    distances_right = np.linalg.norm(right_points - clicked_pos, axis=1) if len(right_points) else [np.inf]
-    closest_left = np.min(distances_left)
-    closest_right = np.min(distances_right)
-    if closest_left < closest_right:
-        artery = 'left'
-        points = left_points
-        selected_points = selected_points_left
-        visual_objects = visual_objects_left
-    else:
-        artery = 'right'
-        points = right_points
-        selected_points = selected_points_right
-        visual_objects = visual_objects_right
-    if len(points) == 0:
-        print(f"Brak punktów szkieletu dla {artery.upper()}!")
-        return
-    max_points = 3 if artery == 'left' else 2
-    if len(selected_points) >= max_points:
-        print(f"Już wybrano {max_points} punktów dla {artery} tętnicy.")
-        return
-    distances = np.linalg.norm(points - clicked_pos, axis=1)
-    closest_idx = np.argmin(distances)
-    closest_point = points[closest_idx]
-    selected_points.append(closest_idx)
-    # Kolory punktów
-    colors = ['green', 'red', 'orange'] if artery == 'left' else ['green', 'red']
-    point_color = colors[len(selected_points) - 1]
-    point_sphere = vedo.Sphere(pos=closest_point, r=1, c=point_color)
-    plt.add(point_sphere)
-    visual_objects.append(point_sphere)
-    print(f"[{artery.upper()}] Indeks klikniętego punktu: {closest_idx}, Koordynaty: {closest_point}")
-    if (artery == 'left' and len(selected_points) == 3) or (artery == 'right' and len(selected_points) == 2):
-        find_paths(artery)
-
-def find_paths(artery):
-    if artery == 'left':
-        G = G_left
-        points = left_points
-        selected_points = selected_points_left
-        visual_objects = visual_objects_left
-        dist_map = left_dist_map
-    else:
-        G = G_right
-        points = right_points
-        selected_points = selected_points_right
-        visual_objects = visual_objects_right
-        dist_map = right_dist_map
-
-    if (artery == 'left' and len(selected_points) < 3) or (artery == 'right' and len(selected_points) < 2):
-        print(f"Zbyt mało punktów dla {artery} tętnicy.")
-        return
-
-    start_idx = selected_points[0]
-    end1_idx = selected_points[1]
-    end2_idx = selected_points[2] if artery == 'left' else None
-
-    def path_diameter_report(path, points, dist_map):
-        diameters = []
-        for idx in path:
-            p = points[idx]
-            diam = local_average_diameter(p, dist_map)
-            dist = diam / 2
-            diameters.append((tuple(p), dist, diam))
-        return diameters
-
-    try:
-        path1 = nx.shortest_path(G, start_idx, end1_idx)
-        path1_points = points[path1]
-        diam_info1 = path_diameter_report(path1,points,dist_map)
-        diams1 = [d[2] for d in diam_info1]
-        line1 = vedo.Line(path1_points)
-        line1.cmap('jet', diams1)
-        line1.lw(8)
-        if artery == 'left':
-            line1.add_scalarbar(title="Lewa srednica [mm]",pos=((0,0.05),(0.1,0.35)))
-        elif artery == 'right':
-            line1.add_scalarbar(title="Prawa srednica [mm]",pos=((0.85,0.05),(0.95,0.35)))
-        plt.add(line1)
-        visual_objects.append(line1)
-        print(f"[{artery.upper()}] Ścieżka 1: {len(path1)} punktów")
-        print("Średnica na ścieżce 1 (mm):", np.round(diams1, 2))
-
-        score1, max_stenosis1, regions1 = analyze_cadrads(diams1,spacing=left_spacing if artery == 'left' else right_spacing,min_stenosis=50, max_markers=1)
-        print(f"[{artery.upper()}] CAD-RADS Path 1: {score1}, maksymalne zwężenie: {max_stenosis1}%")
-        for idx, sten in regions1:
-            sten_point = points[path1[idx]]
-            sten_sphere = vedo.Sphere(pos=sten_point, r=1.5, c='red')
-            plt.add(sten_sphere)
-            visual_objects.append(sten_sphere)
-
-    except nx.NetworkXNoPath:
-        print(f"[{artery.upper()}] Nie znaleziono ścieżki 1")
-
-    if artery == 'left':
-        try:
-            path2 = nx.shortest_path(G, start_idx, end2_idx)
-            path2_points = points[path2]
-            diam_info2 = path_diameter_report(path2,points, dist_map)
-            diams2 = [d[2] for d in diam_info2]
-            line2 = vedo.Line(path2_points)
-            line2.cmap('jet', diams2)
-            line2.lw(8)
-            #line2.add_scalarbar(title="Średnica [mm]")
-            plt.add(line2)
-            visual_objects.append(line2)
-            print(f"[{artery.upper()}] Ścieżka 2: {len(path2)} punktów")
-            print("Średnica na ścieżce 2 (mm):", np.round(diams2, 2))
-
-            score2, max_stenosis2, regions2 = analyze_cadrads(diams2,spacing=left_spacing if artery == 'left' else right_spacing, min_stenosis=50, max_markers=1)
-            print(f"[{artery.upper()}] CAD-RADS Path 2: {score2}, maksymalne zwężenie: {max_stenosis2}%")
-            for idx, sten in regions2:
-                sten_point = points[path2[idx]]
-                sten_sphere = vedo.Sphere(pos=sten_point, r=1.5, c='red')
-                plt.add(sten_sphere)
-                visual_objects.append(sten_sphere)
-
-        except nx.NetworkXNoPath:
-            print(f"[{artery.upper()}] Nie znaleziono ścieżki 2")
-        # Szukanie punktu rozgałęzienia
-        if 'path1' in locals() and 'path2' in locals():
-            common_length = min(len(path1), len(path2))
-            branch_point_idx = 0
-            for i in range(common_length):
-                if path1[i] != path2[i]:
-                    break
-                branch_point_idx = i
-            branch_point = points[path1[branch_point_idx]]
-            branch_sphere = vedo.Sphere(pos=branch_point, r=1, c='purple')
-            plt.add(branch_sphere)
-            visual_objects.append(branch_sphere)
-            print(f"[{artery.upper()}] Punkt rozgałęzienia: {branch_point}")
-
-    print(f"[{artery.upper()}] Sprawdzam ścieżki między indeksami: {selected_points}")
-    plt.render()
-
-def analyze_cadrads(diameters, spacing, step=1, window=3, min_stenosis=30, max_markers=3):
-    """
-    Analizuje lokalne zwężenia CAD-RADS wzdłuż listy średnic.
-    diameters: lista średnic w mm wzdłuż ścieżki.
-    step: co ile kroków sprawdzamy.
-    window: ile kroków wstecz porównujemy.
-    min_stenosis: minimalne zwężenie (%) do oznaczenia
-    max_markers: maksymalna liczba znaczników do wyświetlenia
-    """
-    max_narrowing = 0
-    narrowing_regions = []
-
-    diameters = smooth_diameters(diameters, sigma=0.2)
-
-    for i in range(window, len(diameters), step):
-        prev_window = diameters[i - window:i - 1]
-        curr = diameters[i]
-
-        if len(prev_window) < 2 or curr < 1.0:
-            continue
-
-        ref_diam = np.percentile(prev_window, 75)
-        if ref_diam <= 0 or ref_diam < 1.0:
-            continue
-
-        stenosis = (1 - curr / ref_diam) * 100
-        if stenosis > max_narrowing:
-            max_narrowing = stenosis
-        if stenosis >= min_stenosis:
-            narrowing_regions.append((i, stenosis))
-
-    # Sortuj i ogranicz
-    narrowing_regions.sort(key=lambda x: x[1], reverse=True)
-    narrowing_regions = narrowing_regions[:max_markers]
-
-    # Klasyfikacja CAD-RADS
-    if max_narrowing == 0:
-        score = "CAD-RADS 0 (brak zwężenie)"
-    elif max_narrowing < 25:
-        score = "CAD-RADS 1 (minimalne zwężenie)"
-    elif max_narrowing < 50:
-        score = "CAD-RADS 2 (łagodne zwężenie)"
-    elif max_narrowing < 70:
-        score = "CAD-RADS 3 (umiarkowane)"
-    elif max_narrowing < 90:
-        score = "CAD-RADS 4 (ciężkie)"
-    else:
-        score = "CAD-RADS 5 (prawie całkowita okluzja)"
-
-    return score, round(max_narrowing, 2), narrowing_regions
-
-
-def smooth_diameters(diams, sigma=0.2):
-    """Wygładza zmienność średnic naczynia, aby uniknąć szumów i artefaktów."""
-    return gaussian_filter1d(diams, sigma=sigma)
-
-
-def handle_keypress(event):
-    key = event.keypress.lower()
-    if key == 'r':
-        reset_selection('all')
-    elif key == 'l':
-        reset_selection('left')
-    elif key == 'p':
-        reset_selection('right')
-
-plt.add_callback('LeftButtonPress', handle_click)
-plt.add_callback("KeyPress", handle_keypress)
-plt.interactive().close()
+    print("\n" + "-"*80)
+    print(f"ŚREDNI F1-SCORE (Macro-Average): {avg_f1:.4f}")
+    print(f"GLOBALNY F1-SCORE (Micro-Average): {gl_f1:.4f}")
+    print(f"SUMA: TP={total_tp}, FP={total_fp}, FN={total_fn}")
+    print("="*80)
+    
+    # --- WYKRES SŁUPKOWY ---
+    plt.figure(figsize=(12, 6))
+    x = np.arange(len(df))
+    width = 0.35
+    
+    # Rysujemy Rzeczywiste (jako tło) i Wykryte (TP+FP)
+    plt.bar(x - width/2, df["GT (Prawda)"], width, label='Ground Truth (Opis Lekarza)', color='lightgray', edgecolor='black')
+    plt.bar(x + width/2, df["TP (Trafienia)"], width, label='Poprawne Detekcje (TP)', color='green')
+    # FP rysujemy na górze słupka TP (stacked) lub obok - tu zrobimy obok dla czytelności
+    # Ale żeby nie zaciemniać, narysujmy po prostu TP i FP obok siebie
+    
+    plt.clf() # Czyścimy
+    
+    # Nowy, lepszy wykres: TP, FP, FN
+    width = 0.25
+    plt.bar(x - width, df["TP (Trafienia)"], width, label='Trafienia (TP)', color='#2ca02c') # Zielony
+    plt.bar(x,        df["FP (Fałszywe)"],  width, label='Fałszywe Alarmy (FP)', color='#d62728') # Czerwony
+    plt.bar(x + width, df["FN (Przeoczone)"], width, label='Przeoczone (FN)', color='#ff7f0e') # Pomarańczowy
+    
+    plt.xlabel('Pacjent')
+    plt.ylabel('Liczba Zwężeń')
+    plt.title('Skuteczność detekcji dla poszczególnych przypadków testowych')
+    plt.xticks(x, df["Patient"], rotation=45, ha='right')
+    plt.legend()
+    plt.grid(axis='y', linestyle='--', alpha=0.5)
+    plt.tight_layout()
+    
+    plt.savefig("final_validation_chart.png", dpi=300)
+    print("\nWykres zapisano jako 'final_validation_chart.png'")
