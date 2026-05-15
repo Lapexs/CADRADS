@@ -6,7 +6,9 @@ sciezki w grafie, szacuje srednice naczynia i wykrywa lokalne zwezenia na
 podstawie spadku srednicy oraz gradientu.
 
 Projekt jest w obecnym stanie badawczo-prototypowy: sciezki do danych i listy
-pacjentow sa wpisane bezposrednio w skryptach, a dane NRRD nie sa czescia repo.
+pacjentow sa wpisane bezposrednio w skryptach. Repo zawiera jeden przykladowy
+przypadek w folderze `data/`, a wieksze zestawy danych powinny byc trzymane
+przez Git LFS albo zewnetrzny storage.
 
 ## Najwazniejsze pliki
 
@@ -26,6 +28,28 @@ Skrypty oczekuja segmentacji tetnic w formacie `.nrrd`, zwykle w parach:
 - `Segmentation_left.nrrd`
 - `Segmentation_right.nrrd`
 
+W repo znajduje sie jeden przykladowy przypadek:
+
+```text
+data/
+|-- Segmentation_left.nrrd
+`-- Segmentation_right.nrrd
+```
+
+Pliki `.nrrd` sa sledzone przez Git LFS, co jest zapisane w `.gitattributes`:
+
+```text
+*.nrrd filter=lfs diff=lfs merge=lfs -text
+```
+
+Po sklonowaniu repo upewnij sie, ze Git LFS jest wlaczony i pobierz wlasciwa
+zawartosc plikow:
+
+```bash
+git lfs install
+git lfs pull
+```
+
 W konfiguracjach pacjentow uzywane sa trzy glowne naczynia:
 
 - `RCA`
@@ -38,9 +62,9 @@ Dla kazdego przypadku konfiguracja zawiera:
 - `start_node` i `end_node` - indeksy wezlow szkieletu/grafu wyznaczajace analizowana sciezke,
 - `true_stenoses_mm` - pozycje referencyjnych zwezen w milimetrach, uzywane do walidacji.
 
-Uwaga: obecnie w plikach sa lokalne sciezki Windows, np.
+Uwaga: czesc skryptow nadal ma lokalne sciezki Windows, np.
 `C:\Users\PC\Desktop\INZYNIERKA\Slicer_JM\...`. Przed uruchomieniem trzeba je
-zmienic na sciezki dostepne na danym komputerze.
+zmienic na sciezki dostepne na danym komputerze albo na pliki z folderu `data/`.
 
 ## Wymagania
 
@@ -74,8 +98,8 @@ Jesli na danym systemie interpreter jest dostepny jako `python`, mozna uzyc
 2. Na dole pliku ustaw poprawne sciezki:
 
    ```python
-   LEFT_FILE = r".../Segmentation_left.nrrd"
-   RIGHT_FILE = r".../Segmentation_right.nrrd"
+   LEFT_FILE = r"data/Segmentation_left.nrrd"
+   RIGHT_FILE = r"data/Segmentation_right.nrrd"
    ```
 
 3. Uruchom:
