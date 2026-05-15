@@ -190,47 +190,6 @@ W uproszczeniu pipeline wyglada tak:
    fragmentach naczynia.
 10. Przypisanie orientacyjnej klasy CAD-RADS na podstawie maksymalnego zwezenia.
 
-## Ograniczenia i rzeczy do uporzadkowania
-
-- Dane i sciezki sa zahardkodowane w wielu plikach.
-- Konfiguracja pacjentow powtarza sie w kilku skryptach.
-- Brakuje `requirements.txt` lub innego manifestu zaleznosci.
-- Brakuje automatycznych testow jednostkowych.
-- Skrypty walidacyjne wymagaja lokalnych danych NRRD, ktorych nie ma w repo.
-- Kod zawiera elementy prototypowe i komentarze robocze.
-- Wyniki algorytmu wymagaja weryfikacji eksperckiej; to nie jest certyfikowane
-  narzedzie diagnostyczne.
-
-## Proponowana struktura na przyszlosc
-
-Docelowo repo mozna uporzadkowac w taki sposob:
-
-```text
-.
-|-- src/
-|   |-- artery.py
-|   |-- detection.py
-|   |-- visualization.py
-|   `-- validation.py
-|-- configs/
-|   `-- patients.example.yaml
-|-- scripts/
-|   |-- run_interactive.py
-|   |-- validate.py
-|   `-- grid_search.py
-|-- outputs/
-|-- requirements.txt
-`-- README.md
-```
-
-Najbardziej oplacalne pierwsze kroki porzadkowania:
-
-1. Przeniesienie konfiguracji pacjentow do jednego pliku YAML/JSON.
-2. Dodanie `requirements.txt`.
-3. Rozdzielenie logiki algorytmu od wizualizacji i skryptow eksperymentalnych.
-4. Dodanie przykladowej konfiguracji bez prywatnych lokalnych sciezek.
-5. Dodanie `.gitignore` dla generowanych wykresow i katalogow wynikowych.
-
 ## Disclaimer
 
 Projekt sluzy do eksperymentow badawczych i wsparcia analizy obrazowej. Wyniki
